@@ -65,7 +65,7 @@
   - _Requirements: 4.2_
   - _Completed: Implemented comprehensive Informer-based real-time synchronization with SharedIndexInformer, event handlers for Add/Update/Delete operations, automatic cache synchronization, and comprehensive unit tests covering all event scenarios_
 
-- [ ] 2.4 AWS 태그 기반 복구 메커니즘
+- [x] 2.4 AWS 태그 기반 복구 메커니즘
   - 태그에서 매핑 정보 복구 함수 구현
   - CRD 손실 시 자동 재생성 로직
   - 주기적 동기화 작업 구현

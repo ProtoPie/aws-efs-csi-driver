@@ -107,6 +107,9 @@ type Cloud interface {
 	ListAccessPoints(ctx context.Context, fileSystemId string) (accessPoints []*AccessPoint, err error)
 	DescribeFileSystem(ctx context.Context, fileSystemId string) (fs *FileSystem, err error)
 	DescribeMountTargets(ctx context.Context, fileSystemId, az string) (fs *MountTarget, err error)
+	// Tag-based recovery methods for namespace provisioning
+	FindFileSystemsByTags(ctx context.Context, tags map[string]string) (fileSystems []*FileSystem, err error)
+	GetFileSystemTags(ctx context.Context, fileSystemId string) (tags map[string]string, err error)
 }
 
 type cloud struct {
@@ -489,4 +492,105 @@ func getMountTargetForAz(mountTargets []types.MountTargetDescription, azName str
 	}
 	klog.Infof("There is no mount target match %v", azName)
 	return nil
+}
+
+// FindFileSystemsByTags finds EFS file systems matching the given tags
+// This is used for tag-based recovery of namespace-to-EFS mappings
+func (c *cloud) FindFileSystemsByTags(ctx context.Context, tags map[string]string) ([]*FileSystem, error) {
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("at least one tag must be provided for file system search")
+	}
+
+	klog.V(4).Infof("Finding file systems by tags: %+v", tags)
+
+	// List all file systems first
+	describeFsInput := &efs.DescribeFileSystemsInput{}
+	res, err := c.efs.DescribeFileSystems(ctx, describeFsInput, func(o *efs.Options) {
+		o.Retryer = c.rm.describeFileSystemsRetryer
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil, ErrAccessDenied
+		}
+		return nil, fmt.Errorf("failed to list file systems: %w", err)
+	}
+
+	var matchedFileSystems []*FileSystem
+	for _, fs := range res.FileSystems {
+		if fs.FileSystemId == nil {
+			continue
+		}
+
+		// Check if file system has all required tags
+		fsTags, err := c.GetFileSystemTags(ctx, *fs.FileSystemId)
+		if err != nil {
+			klog.V(2).Infof("Failed to get tags for file system %s: %v", *fs.FileSystemId, err)
+			continue
+		}
+
+		if hasAllTags(fsTags, tags) {
+			matchedFileSystems = append(matchedFileSystems, &FileSystem{
+				FileSystemId: *fs.FileSystemId,
+			})
+			klog.V(4).Infof("Found matching file system: %s", *fs.FileSystemId)
+		}
+	}
+
+	klog.V(4).Infof("Found %d file systems matching tags", len(matchedFileSystems))
+	return matchedFileSystems, nil
+}
+
+// GetFileSystemTags retrieves tags for a specific EFS file system
+func (c *cloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) {
+	if fileSystemId == "" {
+		return nil, fmt.Errorf("fileSystemId cannot be empty")
+	}
+
+	klog.V(5).Infof("Getting tags for file system: %s", fileSystemId)
+
+	// Use DescribeFileSystems to get the file system with tags
+	describeFsInput := &efs.DescribeFileSystemsInput{
+		FileSystemId: &fileSystemId,
+	}
+	res, err := c.efs.DescribeFileSystems(ctx, describeFsInput, func(o *efs.Options) {
+		o.Retryer = c.rm.describeFileSystemsRetryer
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil, ErrAccessDenied
+		}
+		if isFileSystemNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to describe file system %s: %w", fileSystemId, err)
+	}
+
+	if len(res.FileSystems) == 0 {
+		return nil, ErrNotFound
+	}
+	if len(res.FileSystems) > 1 {
+		return nil, fmt.Errorf("expected exactly 1 file system, got %d", len(res.FileSystems))
+	}
+
+	// Convert EFS tags to map
+	tags := make(map[string]string)
+	for _, tag := range res.FileSystems[0].Tags {
+		if tag.Key != nil && tag.Value != nil {
+			tags[*tag.Key] = *tag.Value
+		}
+	}
+
+	klog.V(5).Infof("Found %d tags for file system %s", len(tags), fileSystemId)
+	return tags, nil
+}
+
+// hasAllTags checks if actualTags contains all key-value pairs from requiredTags
+func hasAllTags(actualTags, requiredTags map[string]string) bool {
+	for requiredKey, requiredValue := range requiredTags {
+		actualValue, exists := actualTags[requiredKey]
+		if !exists || actualValue != requiredValue {
+			return false
+		}
+	}
+	return true
 }

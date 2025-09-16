@@ -30,6 +30,7 @@ import (
 	"k8s.io/klog/v2"
 
 	efsv1alpha1 "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/apis/efs/v1alpha1"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 )
 
 // NamespaceEFSMapping represents the mapping between a namespace and EFS filesystem
@@ -57,6 +58,10 @@ type NamespaceEFSMapperInterface interface {
 	// Cache operations
 	InvalidateCache(namespace string)
 	ClearCache()
+
+	// Recovery operations
+	RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error)
+	SyncWithAWSTags(ctx context.Context, clusterID string) error
 }
 
 // NamespaceEFSMapper manages the mapping between Kubernetes namespaces and EFS filesystems
@@ -68,6 +73,9 @@ type NamespaceEFSMapper struct {
 	// Kubernetes client for general operations
 	k8sClient kubernetes.Interface
 
+	// AWS cloud client for tag-based recovery
+	cloudClient cloud.Cloud
+
 	// Local cache for performance optimization
 	cache      map[string]*NamespaceEFSMapping
 	cacheMutex sync.RWMutex
@@ -77,7 +85,10 @@ type NamespaceEFSMapper struct {
 	stopCh   chan struct{}
 
 	// Configuration
-	resyncPeriod time.Duration
+	resyncPeriod    time.Duration
+	syncPeriod      time.Duration
+	lastSyncTime    time.Time
+	syncMutex       sync.Mutex
 
 	// Initialization state
 	initialized bool
@@ -85,12 +96,15 @@ type NamespaceEFSMapper struct {
 }
 
 // NewNamespaceEFSMapper creates a new instance of NamespaceEFSMapper
-func NewNamespaceEFSMapper(k8sClient kubernetes.Interface, config *rest.Config) (*NamespaceEFSMapper, error) {
+func NewNamespaceEFSMapper(k8sClient kubernetes.Interface, config *rest.Config, cloudClient cloud.Cloud) (*NamespaceEFSMapper, error) {
 	if k8sClient == nil {
 		return nil, fmt.Errorf("kubernetes client cannot be nil")
 	}
 	if config == nil {
 		return nil, fmt.Errorf("rest config cannot be nil")
+	}
+	if cloudClient == nil {
+		return nil, fmt.Errorf("cloud client cannot be nil")
 	}
 
 	// Create CRD client
@@ -102,8 +116,10 @@ func NewNamespaceEFSMapper(k8sClient kubernetes.Interface, config *rest.Config) 
 	mapper := &NamespaceEFSMapper{
 		crdClient:    crdClient,
 		k8sClient:    k8sClient,
+		cloudClient:  cloudClient,
 		cache:        make(map[string]*NamespaceEFSMapping),
-		resyncPeriod: 5 * time.Minute, // Default resync period
+		resyncPeriod: 5 * time.Minute,  // Default resync period
+		syncPeriod:   30 * time.Minute, // Default sync period for tag recovery
 		stopCh:       make(chan struct{}),
 	}
 
@@ -432,4 +448,143 @@ func (m *NamespaceEFSMapper) onEFSNamespaceUpdate(efsNamespace *efsv1alpha1.EFSN
 func (m *NamespaceEFSMapper) onEFSNamespaceDelete(efsNamespace *efsv1alpha1.EFSNamespace) {
 	klog.V(4).InfoS("EFSNamespace deleted", "namespace", efsNamespace.Spec.Namespace)
 	m.invalidateCache(efsNamespace.Spec.Namespace)
+}
+
+// RecoverFromAWSTags recovers namespace-to-EFS mappings from AWS tags
+// This is used when CRD data is lost but EFS filesystems still exist with proper tags
+func (m *NamespaceEFSMapper) RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error) {
+	if clusterID == "" {
+		return 0, fmt.Errorf("clusterID cannot be empty")
+	}
+
+	klog.V(2).InfoS("Starting tag-based recovery", "clusterID", clusterID)
+
+	// Define the tags to search for namespace-provisioned EFS filesystems
+	searchTags := map[string]string{
+		"kubernetes.io/cluster/" + clusterID: "owned",
+		"kubernetes.io/provisioning-mode":   "efs-ns",
+	}
+
+	// Find EFS filesystems with the required tags
+	fileSystems, err := m.cloudClient.FindFileSystemsByTags(ctx, searchTags)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find file systems by tags: %w", err)
+	}
+
+	klog.V(4).InfoS("Found file systems for recovery", "count", len(fileSystems), "clusterID", clusterID)
+
+	recoveredCount := 0
+	for _, fs := range fileSystems {
+		// Get all tags for this filesystem to extract namespace information
+		tags, err := m.cloudClient.GetFileSystemTags(ctx, fs.FileSystemId)
+		if err != nil {
+			klog.ErrorS(err, "Failed to get tags for filesystem during recovery", "fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		// Extract namespace from tags
+		namespace, exists := tags["kubernetes.io/namespace"]
+		if !exists || namespace == "" {
+			klog.V(2).InfoS("Skipping filesystem without namespace tag", "fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		// Get region from metadata (this could also come from tags if needed)
+		region := m.cloudClient.GetMetadata().GetRegion()
+
+		// Get FileSystemArn from tags - skip filesystem if not available
+		fileSystemArn, hasArn := tags["kubernetes.io/filesystem-arn"]
+		if !hasArn {
+			// Skip this filesystem if ARN is not available in tags
+			klog.V(4).InfoS("Skipping filesystem without ARN tag", "fileSystemId", fs.FileSystemId)
+			continue
+		}
+
+		// Check if mapping already exists
+		existingMapping, err := m.GetMapping(ctx, namespace)
+		if err != nil {
+			klog.ErrorS(err, "Failed to check existing mapping during recovery", "namespace", namespace)
+			continue
+		}
+
+		if existingMapping != nil {
+			// Mapping already exists, check if it matches
+			if existingMapping.FileSystemID == fs.FileSystemId {
+				klog.V(4).InfoS("Mapping already exists and matches", "namespace", namespace, "fileSystemID", fs.FileSystemId)
+				continue
+			} else {
+				klog.V(2).InfoS("Mapping exists but with different filesystem",
+					"namespace", namespace,
+					"existingFS", existingMapping.FileSystemID,
+					"taggedFS", fs.FileSystemId)
+				continue
+			}
+		}
+
+		// Create the mapping
+		_, err = m.CreateOrUpdateMapping(ctx, namespace, fs.FileSystemId, fileSystemArn, region)
+		if err != nil {
+			klog.ErrorS(err, "Failed to create mapping during recovery",
+				"namespace", namespace,
+				"fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		recoveredCount++
+		klog.V(2).InfoS("Recovered mapping from tags",
+			"namespace", namespace,
+			"fileSystemID", fs.FileSystemId)
+	}
+
+	klog.V(2).InfoS("Tag-based recovery completed",
+		"recoveredCount", recoveredCount,
+		"totalFound", len(fileSystems))
+
+	return recoveredCount, nil
+}
+
+// SyncWithAWSTags performs periodic synchronization with AWS tags
+// This ensures consistency between CRD state and actual AWS resources
+func (m *NamespaceEFSMapper) SyncWithAWSTags(ctx context.Context, clusterID string) error {
+	m.syncMutex.Lock()
+	defer m.syncMutex.Unlock()
+
+	// Check if enough time has passed since last sync
+	if time.Since(m.lastSyncTime) < m.syncPeriod {
+		klog.V(4).InfoS("Skipping sync, not enough time elapsed",
+			"timeSinceLastSync", time.Since(m.lastSyncTime),
+			"syncPeriod", m.syncPeriod)
+		return nil
+	}
+
+	klog.V(4).InfoS("Starting periodic sync with AWS tags", "clusterID", clusterID)
+
+	// Perform recovery to sync any missing mappings
+	recoveredCount, err := m.RecoverFromAWSTags(ctx, clusterID)
+	if err != nil {
+		klog.ErrorS(err, "Failed to sync with AWS tags")
+		return fmt.Errorf("failed to sync with AWS tags: %w", err)
+	}
+
+	// Update last sync time
+	m.lastSyncTime = time.Now()
+
+	klog.V(4).InfoS("Periodic sync completed",
+		"recoveredCount", recoveredCount,
+		"lastSyncTime", m.lastSyncTime)
+
+	return nil
+}
+
+// SetSyncPeriod allows configuring the sync period for tag-based recovery
+func (m *NamespaceEFSMapper) SetSyncPeriod(period time.Duration) {
+	m.syncMutex.Lock()
+	defer m.syncMutex.Unlock()
+
+	if period < time.Minute {
+		period = time.Minute // Minimum 1 minute
+	}
+
+	m.syncPeriod = period
+	klog.V(4).InfoS("Updated sync period", "syncPeriod", period)
 }

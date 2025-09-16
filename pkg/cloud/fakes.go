@@ -112,3 +112,15 @@ func (c *FakeCloudProvider) ListAccessPoints(ctx context.Context, fileSystemId s
 	}
 	return accessPoints, nil
 }
+
+// FindFileSystemsByTags finds EFS file systems matching the given tags
+func (c *FakeCloudProvider) FindFileSystemsByTags(ctx context.Context, tags map[string]string) ([]*FileSystem, error) {
+	// Simple implementation for testing - returns empty slice
+	return []*FileSystem{}, nil
+}
+
+// GetFileSystemTags retrieves tags for a specific EFS file system
+func (c *FakeCloudProvider) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) {
+	// Simple implementation for testing - returns empty tags
+	return map[string]string{}, nil
+}

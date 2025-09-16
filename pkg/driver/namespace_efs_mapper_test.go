@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	efsv1alpha1 "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/apis/efs/v1alpha1"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 )
 
 // Helper functions for testing without external dependencies
@@ -87,6 +88,90 @@ func assertBool(t *testing.T, condition bool, msg string) {
 	if !condition {
 		t.Errorf("%s: condition was false", msg)
 	}
+}
+
+// mockCloud implements the cloud.Cloud interface for testing
+type mockCloud struct {
+	region                 string
+	accountID             string
+	filesystems           []*cloud.FileSystem
+	fileSystemTags        map[string]map[string]string
+	findFileSystemsError  error
+	getFileSystemTagsError map[string]error
+}
+
+func (mc *mockCloud) GetMetadata() cloud.MetadataService {
+	return &mockMetadata{
+		region:    mc.region,
+		accountID: mc.accountID,
+	}
+}
+
+func (mc *mockCloud) FindFileSystemsByTags(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+	if mc.findFileSystemsError != nil {
+		return nil, mc.findFileSystemsError
+	}
+	return mc.filesystems, nil
+}
+
+func (mc *mockCloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) {
+	if mc.getFileSystemTagsError != nil {
+		if err, exists := mc.getFileSystemTagsError[fileSystemId]; exists {
+			return nil, err
+		}
+	}
+
+	if tags, exists := mc.fileSystemTags[fileSystemId]; exists {
+		return tags, nil
+	}
+	return map[string]string{}, nil
+}
+
+// Implement other required cloud interface methods with no-op implementations
+func (mc *mockCloud) CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DeleteAccessPoint(ctx context.Context, accessPointId string) error {
+	return fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) FindAccessPointByClientToken(ctx context.Context, clientToken, fileSystemId string) (*cloud.AccessPoint, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) ListAccessPoints(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DescribeFileSystem(ctx context.Context, fileSystemId string) (*cloud.FileSystem, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+// mockMetadata implements cloud.MetadataService for testing
+type mockMetadata struct {
+	region    string
+	accountID string
+}
+
+func (mm *mockMetadata) GetInstanceID() string {
+	return "i-1234567890abcdef0"
+}
+
+func (mm *mockMetadata) GetRegion() string {
+	return mm.region
+}
+
+func (mm *mockMetadata) GetAvailabilityZone() string {
+	return mm.region + "a"
 }
 
 // mockEFSNamespaceClient implements efsv1alpha1.EFSNamespaceInterface for testing
@@ -230,11 +315,19 @@ func createTestMapper(t *testing.T) (*NamespaceEFSMapper, *mockEFSNamespaceClien
 	k8sClient := fake.NewSimpleClientset()
 	mockCRDClient := newMockEFSNamespaceClient()
 
+	// Create a minimal mock cloud client for tests that don't need tag functionality
+	mockCloudClient := &mockCloud{
+		region:    "us-east-1",
+		accountID: "123456789012",
+	}
+
 	mapper := &NamespaceEFSMapper{
 		crdClient:    mockCRDClient,
 		k8sClient:    k8sClient,
+		cloudClient:  mockCloudClient,
 		cache:        make(map[string]*NamespaceEFSMapping),
 		resyncPeriod: 100 * time.Millisecond, // Short period for testing
+		syncPeriod:   30 * time.Minute,       // Default sync period
 		stopCh:       make(chan struct{}),
 	}
 
@@ -276,7 +369,7 @@ func TestNewNamespaceEFSMapper(t *testing.T) {
 			// This test would require mocking the rest.Config and CRD client creation
 			// For now, we test the basic validation logic
 			if tt.k8sClient == nil {
-				_, err := NewNamespaceEFSMapper(nil, nil)
+				_, err := NewNamespaceEFSMapper(nil, nil, nil)
 				if err == nil {
 					t.Error("Expected error but got nil")
 				}
@@ -869,4 +962,338 @@ type mockRestConfig struct{}
 
 func (c *mockRestConfig) String() string {
 	return "mock-rest-config"
+}
+
+// Test tag-based recovery mechanism
+func TestRecoverFromAWSTags(t *testing.T) {
+	mapper, mockClient := createTestMapperWithCloud(t)
+	ctx := context.Background()
+	clusterID := "test-cluster"
+
+	tests := []struct {
+		name                  string
+		setupMockCloud       func(*mockCloud)
+		setupExistingMappings map[string]*efsv1alpha1.EFSNamespace
+		expectedRecoveredCount int
+		expectedError         bool
+		verifyMappings        []string // namespace names to verify were created
+	}{
+		{
+			name: "Successfully recover single namespace mapping",
+			setupMockCloud: func(mc *mockCloud) {
+				// Mock FindFileSystemsByTags
+				mc.filesystems = []*cloud.FileSystem{
+					{FileSystemId: "fs-recovered1"},
+				}
+				// Mock GetFileSystemTags
+				mc.fileSystemTags = map[string]map[string]string{
+					"fs-recovered1": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						"kubernetes.io/namespace":           "recovered-ns1",
+						"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-recovered1",
+					},
+				}
+			},
+			setupExistingMappings:  map[string]*efsv1alpha1.EFSNamespace{},
+			expectedRecoveredCount: 1,
+			expectedError:         false,
+			verifyMappings:        []string{"recovered-ns1"},
+		},
+		{
+			name: "Skip existing mappings that match",
+			setupMockCloud: func(mc *mockCloud) {
+				mc.filesystems = []*cloud.FileSystem{
+					{FileSystemId: "fs-existing1"},
+				}
+				mc.fileSystemTags = map[string]map[string]string{
+					"fs-existing1": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						"kubernetes.io/namespace":           "existing-ns",
+					},
+				}
+			},
+			setupExistingMappings: map[string]*efsv1alpha1.EFSNamespace{
+				"existing-ns": {
+					ObjectMeta: metav1.ObjectMeta{Name: "existing-ns"},
+					Spec: efsv1alpha1.EFSNamespaceSpec{
+						Namespace:    "existing-ns",
+						FileSystemID: "fs-existing1",
+						Region:       "us-east-1",
+					},
+				},
+			},
+			expectedRecoveredCount: 0,
+			expectedError:         false,
+			verifyMappings:        []string{}, // No new mappings expected
+		},
+		{
+			name: "Skip filesystems without namespace tag",
+			setupMockCloud: func(mc *mockCloud) {
+				mc.filesystems = []*cloud.FileSystem{
+					{FileSystemId: "fs-no-namespace"},
+				}
+				mc.fileSystemTags = map[string]map[string]string{
+					"fs-no-namespace": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						// Missing namespace tag
+					},
+				}
+			},
+			setupExistingMappings:  map[string]*efsv1alpha1.EFSNamespace{},
+			expectedRecoveredCount: 0,
+			expectedError:         false,
+			verifyMappings:        []string{},
+		},
+		{
+			name: "Recover multiple namespaces",
+			setupMockCloud: func(mc *mockCloud) {
+				mc.filesystems = []*cloud.FileSystem{
+					{FileSystemId: "fs-multi1"},
+					{FileSystemId: "fs-multi2"},
+					{FileSystemId: "fs-multi3"},
+				}
+				mc.fileSystemTags = map[string]map[string]string{
+					"fs-multi1": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						"kubernetes.io/namespace":           "multi-ns1",
+						"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-multi1",
+					},
+					"fs-multi2": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						"kubernetes.io/namespace":           "multi-ns2",
+						"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-multi2",
+					},
+					"fs-multi3": {
+						"kubernetes.io/cluster/test-cluster": "owned",
+						"kubernetes.io/provisioning-mode":   "efs-ns",
+						"kubernetes.io/namespace":           "multi-ns3",
+						"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-multi3",
+					},
+				}
+			},
+			setupExistingMappings:  map[string]*efsv1alpha1.EFSNamespace{},
+			expectedRecoveredCount: 3,
+			expectedError:         false,
+			verifyMappings:        []string{"multi-ns1", "multi-ns2", "multi-ns3"},
+		},
+		{
+			name: "Handle cloud client error",
+			setupMockCloud: func(mc *mockCloud) {
+				mc.findFileSystemsError = fmt.Errorf("AWS API error")
+			},
+			setupExistingMappings:  map[string]*efsv1alpha1.EFSNamespace{},
+			expectedRecoveredCount: 0,
+			expectedError:         true,
+			verifyMappings:        []string{},
+		},
+		{
+			name: "Empty cluster ID error",
+			setupMockCloud: func(mc *mockCloud) {
+				// No setup needed for this test
+			},
+			setupExistingMappings:  map[string]*efsv1alpha1.EFSNamespace{},
+			expectedRecoveredCount: 0,
+			expectedError:         true,
+			verifyMappings:        []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset mock state
+			mapper.cloudClient = &mockCloud{
+				region:    "us-east-1",
+				accountID: "123456789012",
+			}
+			mockClient.resources = make(map[string]*efsv1alpha1.EFSNamespace)
+
+			// Setup existing mappings
+			for name, efsNS := range tt.setupExistingMappings {
+				mockClient.resources[name] = efsNS
+			}
+
+			// Setup mock cloud
+			if tt.setupMockCloud != nil {
+				tt.setupMockCloud(mapper.cloudClient.(*mockCloud))
+			}
+
+			// Test with empty cluster ID if this is that specific test
+			testClusterID := clusterID
+			if tt.name == "Empty cluster ID error" {
+				testClusterID = ""
+			}
+
+			// Execute recovery
+			recoveredCount, err := mapper.RecoverFromAWSTags(ctx, testClusterID)
+
+			// Verify results
+			if tt.expectedError {
+				assertError(t, err, "Expected error but got none")
+			} else {
+				assertNoError(t, err, "Expected no error")
+			}
+
+			if recoveredCount != tt.expectedRecoveredCount {
+				t.Errorf("Expected %d recovered mappings, got %d", tt.expectedRecoveredCount, recoveredCount)
+			}
+
+			// Verify expected mappings were created
+			for _, ns := range tt.verifyMappings {
+				mapping, err := mapper.GetMapping(ctx, ns)
+				assertNoError(t, err, "Should be able to get recovered mapping")
+				assertNotNil(t, mapping, "Recovered mapping should exist")
+				if mapping.Namespace != ns {
+					t.Errorf("Expected namespace %s, got %s", ns, mapping.Namespace)
+				}
+			}
+		})
+	}
+}
+
+func TestSyncWithAWSTags(t *testing.T) {
+	mapper, _ := createTestMapperWithCloud(t)
+	ctx := context.Background()
+	clusterID := "test-cluster"
+
+	// Setup mock cloud
+	mockCloudClient := &mockCloud{
+		region:    "us-east-1",
+		accountID: "123456789012",
+		filesystems: []*cloud.FileSystem{
+			{FileSystemId: "fs-sync1"},
+		},
+		fileSystemTags: map[string]map[string]string{
+			"fs-sync1": {
+				"kubernetes.io/cluster/test-cluster": "owned",
+				"kubernetes.io/provisioning-mode":   "efs-ns",
+				"kubernetes.io/namespace":           "sync-ns1",
+			},
+		},
+	}
+	mapper.cloudClient = mockCloudClient
+
+	tests := []struct {
+		name               string
+		timeSinceLastSync  time.Duration
+		syncPeriod         time.Duration
+		expectedSync       bool
+		expectedError      bool
+	}{
+		{
+			name:              "Sync when enough time has passed",
+			timeSinceLastSync: time.Hour,
+			syncPeriod:        30 * time.Minute,
+			expectedSync:      true,
+			expectedError:     false,
+		},
+		{
+			name:              "Skip sync when not enough time passed",
+			timeSinceLastSync: 10 * time.Minute,
+			syncPeriod:        30 * time.Minute,
+			expectedSync:      false,
+			expectedError:     false,
+		},
+		{
+			name:              "First sync (zero last sync time)",
+			timeSinceLastSync: 0,
+			syncPeriod:        30 * time.Minute,
+			expectedSync:      true,
+			expectedError:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Setup sync timing
+			mapper.syncPeriod = tt.syncPeriod
+			if tt.timeSinceLastSync > 0 {
+				mapper.lastSyncTime = time.Now().Add(-tt.timeSinceLastSync)
+			} else {
+				mapper.lastSyncTime = time.Time{} // Zero time
+			}
+
+			// Execute sync
+			err := mapper.SyncWithAWSTags(ctx, clusterID)
+
+			// Verify results
+			if tt.expectedError {
+				assertError(t, err, "Expected error but got none")
+			} else {
+				assertNoError(t, err, "Expected no error")
+			}
+
+			if tt.expectedSync {
+				// Verify that lastSyncTime was updated
+				if mapper.lastSyncTime.IsZero() {
+					t.Error("Expected lastSyncTime to be updated after sync")
+				}
+			}
+		})
+	}
+}
+
+func TestSetSyncPeriod(t *testing.T) {
+	mapper, _ := createTestMapperWithCloud(t)
+
+	tests := []struct {
+		name           string
+		inputPeriod    time.Duration
+		expectedPeriod time.Duration
+	}{
+		{
+			name:           "Valid period",
+			inputPeriod:    45 * time.Minute,
+			expectedPeriod: 45 * time.Minute,
+		},
+		{
+			name:           "Period too short gets clamped to minimum",
+			inputPeriod:    30 * time.Second,
+			expectedPeriod: time.Minute,
+		},
+		{
+			name:           "Minimum valid period",
+			inputPeriod:    time.Minute,
+			expectedPeriod: time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mapper.SetSyncPeriod(tt.inputPeriod)
+
+			if mapper.syncPeriod != tt.expectedPeriod {
+				t.Errorf("Expected sync period %v, got %v", tt.expectedPeriod, mapper.syncPeriod)
+			}
+		})
+	}
+}
+
+// Helper functions for tag-based recovery tests
+
+func createTestMapperWithCloud(t *testing.T) (*NamespaceEFSMapper, *mockEFSNamespaceClient) {
+	k8sClient := fake.NewSimpleClientset()
+	mockClient := newMockEFSNamespaceClient()
+
+	// Create mock cloud client
+	mockCloudClient := &mockCloud{
+		region:    "us-east-1",
+		accountID: "123456789012",
+	}
+
+	mapper := &NamespaceEFSMapper{
+		crdClient:    mockClient,
+		k8sClient:    k8sClient,
+		cloudClient:  mockCloudClient,
+		cache:        make(map[string]*NamespaceEFSMapping),
+		resyncPeriod: 5 * time.Minute,
+		syncPeriod:   30 * time.Minute,
+		stopCh:       make(chan struct{}),
+	}
+
+	return mapper, mockClient
 }

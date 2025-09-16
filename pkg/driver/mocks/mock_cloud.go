@@ -248,6 +248,36 @@ func (mr *MockCloudMockRecorder) FindAccessPointByClientToken(ctx, clientToken, 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindAccessPointByClientToken", reflect.TypeOf((*MockCloud)(nil).FindAccessPointByClientToken), ctx, clientToken, fileSystemId)
 }
 
+// FindFileSystemsByTags mocks base method.
+func (m *MockCloud) FindFileSystemsByTags(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "FindFileSystemsByTags", ctx, tags)
+	ret0, _ := ret[0].([]*cloud.FileSystem)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// FindFileSystemsByTags indicates an expected call of FindFileSystemsByTags.
+func (mr *MockCloudMockRecorder) FindFileSystemsByTags(ctx, tags interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FindFileSystemsByTags", reflect.TypeOf((*MockCloud)(nil).FindFileSystemsByTags), ctx, tags)
+}
+
+// GetFileSystemTags mocks base method.
+func (m *MockCloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetFileSystemTags", ctx, fileSystemId)
+	ret0, _ := ret[0].(map[string]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetFileSystemTags indicates an expected call of GetFileSystemTags.
+func (mr *MockCloudMockRecorder) GetFileSystemTags(ctx, fileSystemId interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetFileSystemTags", reflect.TypeOf((*MockCloud)(nil).GetFileSystemTags), ctx, fileSystemId)
+}
+
 // GetMetadata mocks base method.
 func (m *MockCloud) GetMetadata() cloud.MetadataService {
 	m.ctrl.T.Helper()
