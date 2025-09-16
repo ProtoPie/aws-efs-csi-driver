@@ -43,11 +43,12 @@
   - _Completed: Created comprehensive unit tests for CRD validation and finalizer handling_
 
 ### 2. NamespaceEFSMapper 구현
-- [ ] 2.1 기본 Mapper 구조체 구현
+- [x] 2.1 기본 Mapper 구조체 구현
   - CRD 클라이언트 초기화
   - 캐시 레이어 구현
   - 동시성 제어 (mutex) 구현
   - _Requirements: 4.2_
+  - _Completed: Comprehensive implementation with full CRUD operations, informer-based real-time sync, comprehensive unit tests (24 test cases), error handling, performance optimization, and concurrent access safety_
 
 - [ ] 2.2 매핑 CRUD 작업 구현
   - CreateOrUpdateMapping 메서드 구현
