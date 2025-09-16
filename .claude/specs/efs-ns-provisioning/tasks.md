@@ -15,11 +15,12 @@
 ## 작업 목록
 
 ### 1. CRD 정의 및 설정
-- [ ] 1.1 EFSNamespace CRD YAML 정의 작성
+- [x] 1.1 EFSNamespace CRD YAML 정의 작성
   - OpenAPI 스키마 정의 포함
   - Status 서브리소스 활성화
   - Finalizers 지원 설정
   - _Requirements: 2.2, 4.2_
+  - _Completed: Created comprehensive CRD with full OpenAPI schema validation_
 
 - [ ] 1.2 CRD 클라이언트 코드 생성
   - code-generator를 사용한 typed client 생성
@@ -27,11 +28,18 @@
   - DeepCopy 메서드 생성
   - _Requirements: 4.2_
 
-- [ ] 1.3 CRD 설치 및 RBAC 설정
+- [x] 1.3 CRD 설치 및 RBAC 설정
   - Helm chart에 CRD 템플릿 추가
   - ServiceAccount에 CRD 권한 추가
   - ClusterRole/ClusterRoleBinding 업데이트
   - _Requirements: 6.2_
+  - _Completed: Added CRD to Helm templates with conditional installation and RBAC permissions_
+
+- [x] 1.4 CRD 단위 테스트 작성
+  - CRD 검증 테스트
+  - 필드 유효성 검사 테스트
+  - Finalizer 처리 테스트
+  - _Completed: Created comprehensive unit tests for CRD validation and finalizer handling_
 
 ### 2. NamespaceEFSMapper 구현
 - [ ] 2.1 기본 Mapper 구조체 구현
