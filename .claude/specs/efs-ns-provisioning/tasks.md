@@ -50,18 +50,20 @@
   - _Requirements: 4.2_
   - _Completed: Comprehensive implementation with full CRUD operations, informer-based real-time sync, comprehensive unit tests (24 test cases), error handling, performance optimization, and concurrent access safety_
 
-- [ ] 2.2 매핑 CRUD 작업 구현
+- [x] 2.2 매핑 CRUD 작업 구현
   - CreateOrUpdateMapping 메서드 구현
   - GetMapping 메서드 구현
   - DeleteMapping 메서드 구현
   - ListMappings 메서드 구현
   - _Requirements: 4.2_
+  - _Completed: All CRUD operations fully implemented with comprehensive error handling, caching, thread safety, and 24 unit test cases covering all scenarios_
 
-- [ ] 2.3 Informer 기반 실시간 동기화
+- [x] 2.3 Informer 기반 실시간 동기화
   - SharedInformer 설정
   - Event handler 구현
   - 캐시 무효화 로직 구현
   - _Requirements: 4.2_
+  - _Completed: Implemented comprehensive Informer-based real-time synchronization with SharedIndexInformer, event handlers for Add/Update/Delete operations, automatic cache synchronization, and comprehensive unit tests covering all event scenarios_
 
 - [ ] 2.4 AWS 태그 기반 복구 메커니즘
   - 태그에서 매핑 정보 복구 함수 구현
