@@ -22,11 +22,12 @@
   - _Requirements: 2.2, 4.2_
   - _Completed: Created comprehensive CRD with full OpenAPI schema validation_
 
-- [ ] 1.2 CRD 클라이언트 코드 생성
+- [x] 1.2 CRD 클라이언트 코드 생성
   - code-generator를 사용한 typed client 생성
   - Informer 및 Lister 생성
   - DeepCopy 메서드 생성
   - _Requirements: 4.2_
+  - _Completed: Created API types, deepcopy methods, client wrapper with informer and lister support, comprehensive tests_
 
 - [x] 1.3 CRD 설치 및 RBAC 설정
   - Helm chart에 CRD 템플릿 추가
