@@ -170,7 +170,7 @@
   - _Requirements: 4.3_
   - **Completed**: Created comprehensive retry package with exponential backoff, jitter, and strategy patterns. Integrated with NamespaceProvisioner, NamespaceLockManager, and distributed locks. Added comprehensive unit tests with 100% pass rate.
 
-- [ ] 5.4 단위 테스트 작성
+- [x] 5.4 단위 테스트 작성
   - 락 획득/해제 테스트
   - 타임아웃 테스트
   - 동시성 스트레스 테스트
