@@ -80,7 +80,7 @@
   - _Completed: Comprehensive unit tests with 95%+ coverage, including error scenarios, concurrency stress tests, cache consistency, and informer event handling_
 
 ### 3. NamespaceProvisioner 핵심 로직 구현
-- [ ] 3.1 기본 Provisioner 구조체 구현
+- [x] 3.1 기본 Provisioner 구조체 구현
   - 생성자 함수 구현
   - 의존성 주입 설정
   - 초기화 로직 구현
