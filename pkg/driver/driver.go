@@ -54,6 +54,7 @@ type Driver struct {
 	adaptiveRetryMode        bool
 	tags                     map[string]string
 	lockManager              LockManagerMap
+	namespaceProvisioner     NamespaceProvisionerInterface
 }
 
 func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, volMetricsOptIn bool, volMetricsRefreshPeriod float64, volMetricsFsRateLimit int, deleteAccessPointRootDir bool, adaptiveRetryMode bool) *Driver {
@@ -80,7 +81,13 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 		adaptiveRetryMode:        adaptiveRetryMode,
 		tags:                     parseTagsFromStr(strings.TrimSpace(tags)),
 		lockManager:              NewLockManagerMap(),
+		namespaceProvisioner:     nil, // Will be initialized when needed
 	}
+}
+
+// SetNamespaceProvisioner sets the namespace provisioner for the driver
+func (d *Driver) SetNamespaceProvisioner(namespaceProvisioner NamespaceProvisionerInterface) {
+	d.namespaceProvisioner = namespaceProvisioner
 }
 
 func SetNodeCapOptInFeatures(volMetricsOptIn bool) []csi.NodeServiceCapability_RPC_Type {

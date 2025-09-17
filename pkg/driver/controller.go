@@ -137,13 +137,21 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	//Parse parameters
 	if value, ok := volumeParams[ProvisioningMode]; ok {
 		provisioningMode = value
-		//TODO: Add FS provisioning mode check when implemented
-		if provisioningMode != AccessPointMode {
-			errStr := "Provisioning mode " + provisioningMode + " is not supported. Only Access point provisioning: 'efs-ap' is supported"
+		// Support both efs-ap and efs-ns provisioning modes
+		if provisioningMode != AccessPointMode && provisioningMode != NamespaceProvisioningMode {
+			errStr := "Provisioning mode " + provisioningMode + " is not supported. Supported modes: 'efs-ap' (Access Point) and 'efs-ns' (Namespace)"
 			return nil, status.Error(codes.InvalidArgument, errStr)
 		}
 	} else {
 		return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", ProvisioningMode)
+	}
+
+	// If efs-ns mode, delegate to NamespaceProvisioner
+	if provisioningMode == NamespaceProvisioningMode {
+		if d.namespaceProvisioner == nil {
+			return nil, status.Error(codes.Internal, "NamespaceProvisioner not initialized")
+		}
+		return d.namespaceProvisioner.CreateNamespaceVolume(ctx, req)
 	}
 
 	accessPointsOptions := &cloud.AccessPointOptions{
@@ -425,6 +433,19 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	volId := req.GetVolumeId()
 	if volId == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	// Try to determine if this is an efs-ns volume by checking if the volumeId looks like an access point ID
+	// In efs-ns mode, volumeId is just the access point ID (fsap-xxx)
+	// In efs-ap mode, volumeId is "fs-xxx::fsap-xxx"
+	if strings.HasPrefix(volId, "fsap-") && !strings.Contains(volId, "::") {
+		// This appears to be an efs-ns volume (just access point ID)
+		if d.namespaceProvisioner != nil {
+			return d.namespaceProvisioner.DeleteNamespaceVolume(ctx, req)
+		} else {
+			klog.Warningf("DeleteVolume: Volume %s appears to be efs-ns mode but NamespaceProvisioner not initialized", volId)
+			// Fall through to regular parsing - maybe it's a malformed efs-ap volume
+		}
 	}
 
 	fileSystemId, _, accessPointId, err := parseVolumeId(volId)

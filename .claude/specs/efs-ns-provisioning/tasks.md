@@ -178,7 +178,7 @@
   - _Requirements: 7.1_
 
 ### 6. Controller 서비스 통합 (최소 변경)
-- [ ] 6.1 controller.go 수정 - 프로비저닝 모드 확인
+- [x] 6.1 controller.go 수정 - 프로비저닝 모드 확인
   - CreateVolume 메서드에 조건문 추가 (약 20줄)
   - provisioningMode 파라미터 파싱
   - efs-ns 모드 감지 로직
