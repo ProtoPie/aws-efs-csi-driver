@@ -124,3 +124,27 @@ func (c *FakeCloudProvider) GetFileSystemTags(ctx context.Context, fileSystemId 
 	// Simple implementation for testing - returns empty tags
 	return map[string]string{}, nil
 }
+
+// CreateFileSystem creates a new EFS filesystem for namespace provisioning
+func (c *FakeCloudProvider) CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (*FileSystem, error) {
+	// Simple implementation for testing - returns a basic filesystem
+	return &FileSystem{
+		FileSystemId:    "fs-fake123456",
+		LifeCycleState:  "available",
+		PerformanceMode: options.PerformanceMode,
+		ThroughputMode:  options.ThroughputMode,
+		Encrypted:       options.Encrypted,
+		Tags:            options.Tags,
+	}, nil
+}
+
+// CreateMountTarget creates a new mount target for an EFS filesystem
+func (c *FakeCloudProvider) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*MountTarget, error) {
+	// Simple implementation for testing - returns a basic mount target
+	return &MountTarget{
+		AZName:        "us-east-1a",
+		AZId:          "use1-az1",
+		MountTargetId: "fsmt-fake123456",
+		IPAddress:     "192.168.1.100",
+	}, nil
+}

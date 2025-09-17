@@ -511,6 +511,188 @@ func (np *NamespaceProvisioner) removeCachedEFS(namespace string) {
 	delete(np.efsCache, namespace)
 }
 
+// CreateNamespaceEFS creates an EFS filesystem for the given namespace
+func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespace string, options *EFSOptions) (*cloud.FileSystem, error) {
+	startTime := time.Now()
+
+	// Check if EFS already exists for this namespace
+	existing, err := np.GetNamespaceEFS(ctx, namespace)
+	if err == nil && existing != nil {
+		klog.V(2).Infof("EFS filesystem already exists for namespace %s: %s", namespace, existing.FileSystemId)
+		return existing, nil
+	}
+
+	// Acquire namespace-level lock to prevent concurrent EFS creation for the same namespace
+	lockKey := fmt.Sprintf("namespace:%s", namespace)
+	if !np.lockManager.lockMutex(lockKey, np.options.CreateTimeout) {
+		err := fmt.Errorf("failed to acquire lock for namespace %s within timeout", namespace)
+		np.metricsCollector.RecordError("acquire_lock", namespace, err)
+		return nil, err
+	}
+	defer func() {
+		np.lockManager.unlockMutex(lockKey)
+	}()
+
+	// Double-check if EFS was created while waiting for lock
+	existing, err = np.GetNamespaceEFS(ctx, namespace)
+	if err == nil && existing != nil {
+		klog.V(2).Infof("EFS filesystem was created by another process for namespace %s: %s", namespace, existing.FileSystemId)
+		return existing, nil
+	}
+
+	// Generate client token for idempotency
+	clientToken := fmt.Sprintf("efs-ns-%s-%d", namespace, time.Now().UnixNano())
+
+	// Build tags including default tags and namespace-specific tags
+	tags := make(map[string]string)
+
+	// Add default tags from options
+	for k, v := range np.options.DefaultTags {
+		tags[k] = v
+	}
+
+	// Add user-provided tags
+	if options != nil && options.Tags != nil {
+		for k, v := range options.Tags {
+			tags[k] = v
+		}
+	}
+
+	// Add required namespace provisioning tags
+	tags["kubernetes.io/namespace"] = namespace
+	tags["kubernetes.io/provisioning-mode"] = "efs-ns"
+	if np.options.ClusterID != "" {
+		tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
+	}
+
+	// Build FileSystemOptions
+	fsOptions := &cloud.FileSystemOptions{
+		Tags: tags,
+	}
+
+	// Apply EFS configuration options if provided
+	if options != nil {
+		fsOptions.PerformanceMode = options.PerformanceMode
+		fsOptions.ThroughputMode = options.ThroughputMode
+		fsOptions.ProvisionedThroughputInMibps = options.ProvisionedThroughputInMibps
+		fsOptions.Encrypted = options.Encrypted
+		fsOptions.KmsKeyId = options.KmsKeyId
+		fsOptions.LifecyclePolicy = options.LifecyclePolicy
+		fsOptions.BackupPolicy = options.BackupPolicy
+	}
+
+	// Set default values if not specified
+	if fsOptions.PerformanceMode == "" {
+		fsOptions.PerformanceMode = "generalPurpose"
+	}
+	if fsOptions.ThroughputMode == "" {
+		fsOptions.ThroughputMode = "bursting"
+	}
+	if !fsOptions.Encrypted {
+		fsOptions.Encrypted = true // Default to encrypted for security
+	}
+
+	klog.V(2).Infof("Creating EFS filesystem for namespace %s with options: %+v", namespace, fsOptions)
+
+	// Create the EFS filesystem
+	filesystem, err := np.cloud.CreateFileSystem(ctx, clientToken, fsOptions)
+	if err != nil {
+		np.metricsCollector.RecordError("create_filesystem", namespace, err)
+		return nil, fmt.Errorf("failed to create EFS filesystem for namespace %s: %w", namespace, err)
+	}
+
+	// Record creation time metric
+	np.metricsCollector.RecordEFSCreationTime(namespace, time.Since(startTime))
+	np.metricsCollector.IncEFSCreated(namespace)
+
+	klog.V(2).Infof("Successfully created EFS filesystem %s for namespace %s in %v",
+		filesystem.FileSystemId, namespace, time.Since(startTime))
+
+	// Store the mapping in the namespace EFS mapper
+	// TODO: Replace with actual account ID from STS GetCallerIdentity
+	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:123456789012:file-system/%s", np.options.Region, filesystem.FileSystemId)
+	if _, err := np.mapper.CreateOrUpdateMapping(ctx, namespace, filesystem.FileSystemId, fileSystemArn, np.options.Region); err != nil {
+		klog.Warningf("Failed to store namespace mapping for %s -> %s: %v", namespace, filesystem.FileSystemId, err)
+		// Don't fail the entire operation, the mapping can be recovered from tags
+	}
+
+	// Cache the filesystem
+	np.setCachedEFS(namespace, filesystem)
+
+	// Update provisioner status
+	np.updateStatus(func(status *ProvisionerStatus) {
+		status.TotalEFSCreated++
+		status.ActiveNamespaces = len(np.efsCache)
+	})
+
+	return filesystem, nil
+}
+
+// GetNamespaceEFS retrieves the EFS filesystem for the given namespace
+func (np *NamespaceProvisioner) GetNamespaceEFS(ctx context.Context, namespace string) (*cloud.FileSystem, error) {
+	// Check cache first
+	if cached := np.getCachedEFS(namespace); cached != nil {
+		klog.V(4).Infof("Found cached EFS for namespace %s: %s", namespace, cached.FileSystemId)
+		return cached, nil
+	}
+
+	// Check the namespace EFS mapper
+	mapping, err := np.mapper.GetMapping(ctx, namespace)
+	if err == nil && mapping != nil && mapping.FileSystemID != "" {
+		// Retrieve filesystem details from AWS
+		fs, err := np.cloud.DescribeFileSystem(ctx, mapping.FileSystemID)
+		if err == nil {
+			np.setCachedEFS(namespace, fs)
+			return fs, nil
+		}
+		klog.Warningf("Failed to describe EFS %s for namespace %s: %v", mapping.FileSystemID, namespace, err)
+	}
+
+	// Fallback: search by tags
+	tags := map[string]string{
+		"kubernetes.io/namespace":         namespace,
+		"kubernetes.io/provisioning-mode": "efs-ns",
+	}
+	if np.options.ClusterID != "" {
+		tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
+	}
+
+	fileSystems, err := np.cloud.FindFileSystemsByTags(ctx, tags)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find EFS for namespace %s: %w", namespace, err)
+	}
+
+	if len(fileSystems) == 0 {
+		return nil, fmt.Errorf("no EFS filesystem found for namespace %s", namespace)
+	}
+
+	if len(fileSystems) > 1 {
+		klog.Warningf("Multiple EFS filesystems found for namespace %s, using the first one", namespace)
+	}
+
+	filesystem := fileSystems[0]
+
+	// Update the mapping if it was missing
+	// TODO: Replace with actual account ID from STS GetCallerIdentity
+	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:123456789012:file-system/%s", np.options.Region, filesystem.FileSystemId)
+	if _, err := np.mapper.CreateOrUpdateMapping(ctx, namespace, filesystem.FileSystemId, fileSystemArn, np.options.Region); err != nil {
+		klog.Warningf("Failed to restore namespace mapping for %s -> %s: %v", namespace, filesystem.FileSystemId, err)
+	}
+
+	// Cache the filesystem
+	np.setCachedEFS(namespace, filesystem)
+
+	return filesystem, nil
+}
+
+// DeleteNamespaceEFS deletes the EFS filesystem for the given namespace
+func (np *NamespaceProvisioner) DeleteNamespaceEFS(ctx context.Context, namespace string) error {
+	// This implementation would be added later as part of the cleanup logic
+	// For now, we'll just log and return nil (retain policy)
+	klog.V(2).Infof("Delete EFS for namespace %s requested - using retain policy", namespace)
+	return nil
+}
+
 // NoOpMetricsCollector is a no-op implementation of MetricsCollector
 type NoOpMetricsCollector struct{}
 

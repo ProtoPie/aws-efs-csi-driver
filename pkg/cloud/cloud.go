@@ -51,7 +51,14 @@ var (
 )
 
 type FileSystem struct {
-	FileSystemId string
+	FileSystemId         string
+	LifeCycleState       string
+	CreationTime         *time.Time
+	PerformanceMode      string
+	ThroughputMode       string
+	Encrypted            bool
+	KmsKeyId             string
+	Tags                 map[string]string
 }
 
 type AccessPoint struct {
@@ -89,6 +96,17 @@ type MountTarget struct {
 	IPAddress     string
 }
 
+type FileSystemOptions struct {
+	PerformanceMode               string
+	ThroughputMode               string
+	ProvisionedThroughputInMibps int64
+	Encrypted                    bool
+	KmsKeyId                     string
+	LifecyclePolicy              string
+	BackupPolicy                 string
+	Tags                         map[string]string
+}
+
 // Efs abstracts efs client(https://docs.aws.amazon.com/sdk-for-go/api/service/efs/)
 type Efs interface {
 	CreateAccessPoint(context.Context, *efs.CreateAccessPointInput, ...func(*efs.Options)) (*efs.CreateAccessPointOutput, error)
@@ -96,6 +114,8 @@ type Efs interface {
 	DescribeAccessPoints(context.Context, *efs.DescribeAccessPointsInput, ...func(*efs.Options)) (*efs.DescribeAccessPointsOutput, error)
 	DescribeFileSystems(context.Context, *efs.DescribeFileSystemsInput, ...func(*efs.Options)) (*efs.DescribeFileSystemsOutput, error)
 	DescribeMountTargets(context.Context, *efs.DescribeMountTargetsInput, ...func(*efs.Options)) (*efs.DescribeMountTargetsOutput, error)
+	CreateFileSystem(context.Context, *efs.CreateFileSystemInput, ...func(*efs.Options)) (*efs.CreateFileSystemOutput, error)
+	CreateMountTarget(context.Context, *efs.CreateMountTargetInput, ...func(*efs.Options)) (*efs.CreateMountTargetOutput, error)
 }
 
 type Cloud interface {
@@ -107,6 +127,9 @@ type Cloud interface {
 	ListAccessPoints(ctx context.Context, fileSystemId string) (accessPoints []*AccessPoint, err error)
 	DescribeFileSystem(ctx context.Context, fileSystemId string) (fs *FileSystem, err error)
 	DescribeMountTargets(ctx context.Context, fileSystemId, az string) (fs *MountTarget, err error)
+	// EFS filesystem creation for namespace provisioning
+	CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (fs *FileSystem, err error)
+	CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (mt *MountTarget, err error)
 	// Tag-based recovery methods for namespace provisioning
 	FindFileSystemsByTags(ctx context.Context, tags map[string]string) (fileSystems []*FileSystem, err error)
 	GetFileSystemTags(ctx context.Context, fileSystemId string) (tags map[string]string, err error)
@@ -346,6 +369,121 @@ func (c *cloud) ListAccessPoints(ctx context.Context, fileSystemId string) (acce
 	return
 }
 
+func (c *cloud) CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (fs *FileSystem, err error) {
+	efsTags := parseEfsTags(options.Tags)
+	createFsInput := &efs.CreateFileSystemInput{
+		CreationToken: &clientToken,
+		Tags:          efsTags,
+	}
+
+	// Set performance mode if specified
+	if options.PerformanceMode != "" {
+		if options.PerformanceMode == "generalPurpose" {
+			createFsInput.PerformanceMode = types.PerformanceModeGeneralPurpose
+		} else if options.PerformanceMode == "maxIO" {
+			createFsInput.PerformanceMode = types.PerformanceModeMaxIo
+		}
+	}
+
+	// Set throughput mode and provisioned throughput if specified
+	if options.ThroughputMode != "" {
+		if options.ThroughputMode == "bursting" {
+			createFsInput.ThroughputMode = types.ThroughputModeBursting
+		} else if options.ThroughputMode == "provisioned" {
+			createFsInput.ThroughputMode = types.ThroughputModeProvisioned
+			if options.ProvisionedThroughputInMibps > 0 {
+				provisionedThroughput := float64(options.ProvisionedThroughputInMibps)
+				createFsInput.ProvisionedThroughputInMibps = &provisionedThroughput
+			}
+		} else if options.ThroughputMode == "elastic" {
+			createFsInput.ThroughputMode = types.ThroughputModeElastic
+		}
+	}
+
+	// Set encryption settings
+	if options.Encrypted {
+		createFsInput.Encrypted = &options.Encrypted
+		if options.KmsKeyId != "" {
+			createFsInput.KmsKeyId = &options.KmsKeyId
+		}
+	}
+
+	klog.V(5).Infof("Calling CreateFileSystem with input: %+v", *createFsInput)
+	res, err := c.efs.CreateFileSystem(ctx, createFsInput, func(o *efs.Options) {
+		o.Retryer = c.rm.createAccessPointRetryer // Reuse the same retryer for consistency
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil, ErrAccessDenied
+		}
+		if isFileSystemAlreadyExists(err) {
+			return nil, ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("Failed to create file system: %v", err)
+	}
+	klog.V(5).Infof("CreateFileSystem response: %+v", res)
+
+	// Convert result to our FileSystem struct
+	filesystem := &FileSystem{
+		FileSystemId:    *res.FileSystemId,
+		LifeCycleState:  string(res.LifeCycleState),
+		PerformanceMode: string(res.PerformanceMode),
+		ThroughputMode:  string(res.ThroughputMode),
+		Encrypted:       res.Encrypted != nil && *res.Encrypted,
+	}
+
+	if res.CreationTime != nil {
+		filesystem.CreationTime = res.CreationTime
+	}
+	if res.KmsKeyId != nil {
+		filesystem.KmsKeyId = *res.KmsKeyId
+	}
+
+	return filesystem, nil
+}
+
+func (c *cloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (mt *MountTarget, err error) {
+	createMtInput := &efs.CreateMountTargetInput{
+		FileSystemId: &fileSystemId,
+		SubnetId:     &subnetId,
+	}
+
+	if securityGroupId != "" {
+		createMtInput.SecurityGroups = []string{securityGroupId}
+	}
+
+	klog.V(5).Infof("Calling CreateMountTarget with input: %+v", *createMtInput)
+	res, err := c.efs.CreateMountTarget(ctx, createMtInput, func(o *efs.Options) {
+		o.Retryer = c.rm.createAccessPointRetryer // Reuse the same retryer for consistency
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil, ErrAccessDenied
+		}
+		if isMountTargetAlreadyExists(err) {
+			return nil, ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("Failed to create mount target: %v", err)
+	}
+	klog.V(5).Infof("CreateMountTarget response: %+v", res)
+
+	mountTarget := &MountTarget{
+		MountTargetId: *res.MountTargetId,
+	}
+
+	if res.IpAddress != nil {
+		mountTarget.IPAddress = *res.IpAddress
+	}
+	if res.AvailabilityZoneName != nil {
+		mountTarget.AZName = *res.AvailabilityZoneName
+	}
+	if res.AvailabilityZoneId != nil {
+		mountTarget.AZId = *res.AvailabilityZoneId
+	}
+
+	return mountTarget, nil
+}
+
 func (c *cloud) DescribeFileSystem(ctx context.Context, fileSystemId string) (fs *FileSystem, err error) {
 	describeFsInput := &efs.DescribeFileSystemsInput{FileSystemId: &fileSystemId}
 	klog.V(5).Infof("Calling DescribeFileSystems with input: %+v", *describeFsInput)
@@ -449,6 +587,26 @@ func isAccessPointAlreadyExists(err error) bool {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		if apiErr.ErrorCode() == AccessPointAlreadyExists {
+			return true
+		}
+	}
+	return false
+}
+
+func isFileSystemAlreadyExists(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode() == "FileSystemAlreadyExists" {
+			return true
+		}
+	}
+	return false
+}
+
+func isMountTargetAlreadyExists(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if apiErr.ErrorCode() == "MountTargetConflict" {
 			return true
 		}
 	}

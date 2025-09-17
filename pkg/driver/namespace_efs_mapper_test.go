@@ -158,6 +158,14 @@ func (mc *mockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az 
 	return nil, fmt.Errorf("not implemented in mock")
 }
 
+func (mc *mockCloud) CreateFileSystem(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
 // mockMetadata implements cloud.MetadataService for testing
 type mockMetadata struct {
 	region    string

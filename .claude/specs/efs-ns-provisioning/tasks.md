@@ -86,7 +86,7 @@
   - 초기화 로직 구현
   - _Requirements: 2.2, 4.1_
 
-- [ ] 3.2 EFS 파일 시스템 생성 로직
+- [x] 3.2 EFS 파일 시스템 생성 로직
   - CreateNamespaceEFS 메서드 구현
   - AWS EFS API 호출 로직
   - 태그 설정 로직 (cluster-id, namespace, provisioning-mode)
