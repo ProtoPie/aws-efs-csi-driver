@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/util/retry"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/retry"
 	"k8s.io/klog/v2"
 )
 
@@ -202,14 +202,15 @@ func (m *NamespaceLockManager) acquireDistributedLock(ctx context.Context, key s
 
 	configMapName := m.getLockConfigMapName(key)
 
-	// Use exponential backoff with jitter for retries
-	backoff := retry.DefaultBackoff
-	backoff.Duration = m.backoffBase
-	backoff.Cap = m.backoffMax
-	backoff.Steps = m.maxRetries
+	// Use lock acquisition strategy with custom configuration
+	strategy := retry.LockAcquisitionStrategy()
+	strategy.MaxAttempts = m.maxRetries
+	strategy.InitialDelay = m.backoffBase
+	strategy.MaxDelay = m.backoffMax
+	strategy.JitterFactor = m.jitterFactor
 
 	var lastErr error
-	err := retry.OnError(backoff, errors.IsConflict, func() error {
+	err := strategy.DoWithName(ctx, fmt.Sprintf("acquire-lock-%s", key), func() error {
 		// Check if context is cancelled
 		select {
 		case <-ctx.Done():

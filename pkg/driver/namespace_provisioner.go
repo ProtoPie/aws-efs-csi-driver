@@ -36,6 +36,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/retry"
 )
 
 const (
@@ -722,8 +723,13 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 
 	klog.V(2).Infof("Creating EFS filesystem for namespace %s with options: %+v", namespace, fsOptions)
 
-	// Create the EFS filesystem
-	filesystem, err := np.cloud.CreateFileSystem(ctx, clientToken, fsOptions)
+	// Create the EFS filesystem with retry logic
+	strategy := retry.EFSProvisioningStrategy()
+	filesystem, err := retry.DoWithResultAndName(ctx, strategy,
+		fmt.Sprintf("create-efs-%s", namespace),
+		func() (*cloud.FileSystem, error) {
+			return np.cloud.CreateFileSystem(ctx, clientToken, fsOptions)
+		})
 	if err != nil {
 		np.metricsCollector.RecordError("create_filesystem", namespace, err)
 		return nil, fmt.Errorf("failed to create EFS filesystem for namespace %s: %w", namespace, err)
@@ -891,39 +897,42 @@ func (np *NamespaceProvisioner) createMountTargetsForEFS(ctx context.Context, fi
 	return nil
 }
 
-// createMountTargetWithRetry creates a mount target with retry logic
+// createMountTargetWithRetry creates a mount target with retry logic using the retry package
 func (np *NamespaceProvisioner) createMountTargetWithRetry(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
-	var lastErr error
+	// Use AWS API strategy for mount target creation
+	strategy := retry.AWSAPIStrategy()
 
-	for attempt := 0; attempt < np.options.MaxRetries; attempt++ {
-		if attempt > 0 {
-			// Exponential backoff with jitter
-			backoffDelay := np.options.RetryDelay * time.Duration(1<<uint(attempt-1))
-			if backoffDelay > np.options.RetryBackoffMax {
-				backoffDelay = np.options.RetryBackoffMax
-			}
-
-			// Add jitter to prevent thundering herd
-			jitter := time.Duration(rand.Int63n(int64(backoffDelay / 4)))
-			time.Sleep(backoffDelay + jitter)
-		}
-
-		mountTarget, err := np.cloud.CreateMountTarget(ctx, fileSystemId, subnetId, securityGroupId)
-		if err == nil {
-			return mountTarget, nil
-		}
-
-		// Check if it's a retryable error
-		if err == cloud.ErrAlreadyExists {
-			klog.V(4).Infof("Mount target already exists in subnet %s", subnetId)
-			return nil, nil // Not an error, just skip this subnet
-		}
-
-		lastErr = err
-		klog.V(4).Infof("Mount target creation attempt %d failed: %v", attempt+1, err)
+	// Override with configured values if provided
+	if np.options.MaxRetries > 0 {
+		strategy.MaxAttempts = np.options.MaxRetries
+	}
+	if np.options.RetryDelay > 0 {
+		strategy.InitialDelay = np.options.RetryDelay
+	}
+	if np.options.RetryBackoffMax > 0 {
+		strategy.MaxDelay = np.options.RetryBackoffMax
 	}
 
-	return nil, fmt.Errorf("failed to create mount target after %d attempts: %w", np.options.MaxRetries, lastErr)
+	// Custom retry condition for mount target creation
+	strategy.RetryableErrors = func(err error) bool {
+		// Don't retry if mount target already exists
+		if err == cloud.ErrAlreadyExists {
+			return false
+		}
+		// Use AWS-specific retry logic
+		return retry.IsAWSRetryableError(err)
+	}
+
+	return retry.DoWithResultAndName(ctx, strategy,
+		fmt.Sprintf("create-mount-target-%s-%s", fileSystemId, subnetId),
+		func() (*cloud.MountTarget, error) {
+			mountTarget, err := np.cloud.CreateMountTarget(ctx, fileSystemId, subnetId, securityGroupId)
+			if err == cloud.ErrAlreadyExists {
+				klog.V(4).Infof("Mount target already exists in subnet %s", subnetId)
+				return nil, nil // Not an error, just skip this subnet
+			}
+			return mountTarget, err
+		})
 }
 
 // SubnetInfo represents subnet information for mount target creation
@@ -1467,8 +1476,13 @@ func (np *NamespaceProvisioner) CreateAccessPointForPVC(ctx context.Context, pvc
 	klog.V(2).Infof("Creating Access Point with path %s, uid=%d, gid=%d, perms=%s",
 		accessPointPath, uid, gid, directoryPerms)
 
-	// Create the Access Point via cloud provider
-	accessPoint, err := np.cloud.CreateAccessPoint(ctx, clientToken, cloudOptions)
+	// Create the Access Point via cloud provider with retry logic
+	strategy := retry.EFSProvisioningStrategy()
+	accessPoint, err := retry.DoWithResultAndName(ctx, strategy,
+		fmt.Sprintf("create-access-point-%s-%s", namespace, pvcName),
+		func() (*cloud.AccessPoint, error) {
+			return np.cloud.CreateAccessPoint(ctx, clientToken, cloudOptions)
+		})
 	if err != nil {
 		np.metricsCollector.RecordError("create_accesspoint", namespace, err)
 		return nil, fmt.Errorf("failed to create Access Point for PVC %s: %w", pvcName, err)
@@ -1529,12 +1543,19 @@ func (np *NamespaceProvisioner) DeleteAccessPointForPVC(ctx context.Context, pvc
 		np.lockManager.unlockMutex(lockKey)
 	}()
 
-	// Delete the Access Point
-	if err := np.cloud.DeleteAccessPoint(ctx, accessPoint.AccessPointId); err != nil {
-		if err == cloud.ErrNotFound {
-			klog.V(2).Infof("Access Point %s for PVC %s already deleted", accessPoint.AccessPointId, pvcName)
-			return nil
-		}
+	// Delete the Access Point with retry logic
+	strategy := retry.AWSAPIStrategy()
+	err = strategy.DoWithName(ctx,
+		fmt.Sprintf("delete-access-point-%s", accessPoint.AccessPointId),
+		func() error {
+			deleteErr := np.cloud.DeleteAccessPoint(ctx, accessPoint.AccessPointId)
+			if deleteErr == cloud.ErrNotFound {
+				klog.V(2).Infof("Access Point %s for PVC %s already deleted", accessPoint.AccessPointId, pvcName)
+				return nil // Not an error, already deleted
+			}
+			return deleteErr
+		})
+	if err != nil {
 		np.metricsCollector.RecordError("delete_accesspoint", namespace, err)
 		return fmt.Errorf("failed to delete Access Point %s for PVC %s: %w", accessPoint.AccessPointId, pvcName, err)
 	}

@@ -26,7 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/util/retry"
+	pkgretry "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/retry"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 )
@@ -235,11 +235,12 @@ type LeaseLock struct {
 // Acquire tries to acquire the lease lock
 func (l *LeaseLock) Acquire(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	backoff := retry.DefaultBackoff
-	backoff.Cap = 5 * time.Second
+
+	// Use lock acquisition strategy for lease locks
+	strategy := pkgretry.LockAcquisitionStrategy()
 
 	var lastErr error
-	err := retry.OnError(backoff, errors.IsConflict, func() error {
+	err := strategy.DoWithName(ctx, fmt.Sprintf("acquire-lease-%s", l.key), func() error {
 		if time.Now().After(deadline) {
 			if lastErr != nil {
 				return lastErr
