@@ -428,9 +428,12 @@ func BenchmarkNamespaceProvisioner_SetCachedEFS(b *testing.B) {
 // Mock implementations for testing
 
 type testMockCloud struct {
-	createFileSystemFunc      func(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error)
-	describeFileSystemFunc    func(ctx context.Context, fileSystemId string) (*cloud.FileSystem, error)
-	findFileSystemsByTagsFunc func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error)
+	createFileSystemFunc        func(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error)
+	describeFileSystemFunc      func(ctx context.Context, fileSystemId string) (*cloud.FileSystem, error)
+	findFileSystemsByTagsFunc   func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error)
+	describeMountTargetsFunc    func(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error)
+	createMountTargetFunc       func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error)
+	getMetadataFunc             func() cloud.MetadataService
 }
 
 func (m *testMockCloud) CreateFileSystem(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
@@ -461,14 +464,29 @@ func (m *testMockCloud) FindFileSystemsByTags(ctx context.Context, tags map[stri
 }
 
 // Other required methods to satisfy the Cloud interface
-func (m *testMockCloud) GetMetadata() cloud.MetadataService                              { return nil }
+func (m *testMockCloud) GetMetadata() cloud.MetadataService {
+	if m.getMetadataFunc != nil {
+		return m.getMetadataFunc()
+	}
+	return nil
+}
 func (m *testMockCloud) CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) { return nil, nil }
 func (m *testMockCloud) DeleteAccessPoint(ctx context.Context, accessPointId string) error { return nil }
 func (m *testMockCloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) { return nil, nil }
 func (m *testMockCloud) FindAccessPointByClientToken(ctx context.Context, clientToken, fileSystemId string) (*cloud.AccessPoint, error) { return nil, nil }
 func (m *testMockCloud) ListAccessPoints(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error) { return nil, nil }
-func (m *testMockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) { return nil, nil }
-func (m *testMockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) { return nil, nil }
+func (m *testMockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) {
+	if m.describeMountTargetsFunc != nil {
+		return m.describeMountTargetsFunc(ctx, fileSystemId, az)
+	}
+	return nil, nil
+}
+func (m *testMockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+	if m.createMountTargetFunc != nil {
+		return m.createMountTargetFunc(ctx, fileSystemId, subnetId, securityGroupId)
+	}
+	return nil, nil
+}
 func (m *testMockCloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) { return nil, nil }
 func (m *testMockCloud) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*cloud.FileSystem, string, error) { return nil, "", nil }
 
@@ -764,7 +782,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_CloudError(t *testing.T) {
 func TestNamespaceProvisioner_CreateNamespaceEFS_LockError(t *testing.T) {
 	mockCloud := &testMockCloud{}
 	mapper := &mockMapper{}
-	lockManager := NewLockManagerMap()
+
 	metrics := &mockMetricsCollector{}
 
 	var errorRecorded bool
@@ -775,21 +793,43 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_LockError(t *testing.T) {
 	}
 
 	options := DefaultProvisionerOptions()
+	options.CreateTimeout = 1 * time.Millisecond // Very short timeout to force failure
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      lockManager,
+		lockManager:      NewLockManagerMap(), // Use default initialization
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
 		status:           &ProvisionerStatus{},
 	}
 
+	// Pre-acquire the lock to force timeout (same pattern as controller tests)
+	lockKey := "namespace:test-namespace"
+	t.Logf("Acquiring lock for key: %s", lockKey)
+	provisioner.lockManager.lockMutex(lockKey) // Hold lock without timeout using provisioner's lockManager
+	defer provisioner.lockManager.unlockMutex(lockKey)
+
 	ctx := context.Background()
+
+	// Add debugging - test the lock acquisition directly
+	start := time.Now()
+	lockSuccess := provisioner.lockManager.lockMutex(lockKey, 1*time.Millisecond)
+	elapsed := time.Since(start)
+	t.Logf("Direct lock test: success=%v, elapsed=%v", lockSuccess, elapsed)
+
+	if lockSuccess {
+		t.Errorf("Expected direct lock acquisition to fail due to timeout, but it succeeded")
+	}
+
+	t.Logf("About to call CreateNamespaceEFS...")
+	start = time.Now()
 	fs, err := provisioner.CreateNamespaceEFS(ctx, "test-namespace", nil)
+	elapsed = time.Since(start)
+	t.Logf("CreateNamespaceEFS completed: success=%v, elapsed=%v, err=%v", fs != nil, elapsed, err)
 
 	if err == nil {
-		t.Errorf("Expected error, got none")
+		t.Errorf("Expected error, got none. fs=%v", fs)
 	}
 	if fs != nil {
 		t.Errorf("Expected filesystem to be nil when lock fails")
@@ -988,5 +1028,338 @@ func TestNamespaceProvisioner_GetNamespaceEFS_NotFound(t *testing.T) {
 	}
 	if !contains(err.Error(), "no EFS filesystem found") {
 		t.Errorf("Expected error message to contain 'no EFS filesystem found', got: %s", err.Error())
+	}
+}
+
+// Test cases for Mount Target creation logic
+
+func TestNamespaceProvisioner_createMountTargetsForEFS_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	metrics := &mockMetricsCollector{}
+
+	options := DefaultProvisionerOptions()
+	options.SubnetIds = []string{"subnet-12345", "subnet-67890"}
+	options.AvailabilityZones = []string{"us-east-1a", "us-east-1b"}
+	options.SecurityGroupId = "sg-12345"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	// Mock DescribeMountTargets to return nil (no existing mount targets)
+	mockCloud.describeMountTargetsFunc = func(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) {
+		return nil, fmt.Errorf("no mount targets found")
+	}
+
+	// Mock CreateMountTarget to succeed
+	createCallCount := 0
+	mockCloud.createMountTargetFunc = func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+		createCallCount++
+		return &cloud.MountTarget{
+			MountTargetId: fmt.Sprintf("fsmt-%d", createCallCount),
+			AZName:        fmt.Sprintf("us-east-1%c", 'a'+createCallCount-1),
+			IPAddress:     fmt.Sprintf("192.168.1.%d", createCallCount),
+		}, nil
+	}
+
+	ctx := context.Background()
+	err := provisioner.createMountTargetsForEFS(ctx, "fs-12345", "test-namespace")
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if createCallCount != 2 {
+		t.Errorf("Expected CreateMountTarget to be called 2 times, got %d", createCallCount)
+	}
+}
+
+func TestNamespaceProvisioner_createMountTargetsForEFS_ExistingTargets(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	metrics := &mockMetricsCollector{}
+
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	// Mock DescribeMountTargets to return existing mount target
+	mockCloud.describeMountTargetsFunc = func(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) {
+		return &cloud.MountTarget{
+			MountTargetId: "fsmt-existing",
+			AZName:        "us-east-1a",
+			IPAddress:     "192.168.1.100",
+		}, nil
+	}
+
+	createCalled := false
+	mockCloud.createMountTargetFunc = func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+		createCalled = true
+		return nil, fmt.Errorf("should not be called")
+	}
+
+	ctx := context.Background()
+	err := provisioner.createMountTargetsForEFS(ctx, "fs-12345", "test-namespace")
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if createCalled {
+		t.Errorf("CreateMountTarget should not have been called when mount targets already exist")
+	}
+}
+
+func TestNamespaceProvisioner_createMountTargetWithRetry_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	mockCloud.createMountTargetFunc = func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+		if fileSystemId != "fs-12345" {
+			t.Errorf("Expected fileSystemId to be 'fs-12345', got %s", fileSystemId)
+		}
+		if subnetId != "subnet-12345" {
+			t.Errorf("Expected subnetId to be 'subnet-12345', got %s", subnetId)
+		}
+		if securityGroupId != "sg-12345" {
+			t.Errorf("Expected securityGroupId to be 'sg-12345', got %s", securityGroupId)
+		}
+		return &cloud.MountTarget{
+			MountTargetId: "fsmt-12345",
+			AZName:        "us-east-1a",
+			IPAddress:     "192.168.1.100",
+		}, nil
+	}
+
+	ctx := context.Background()
+	mt, err := provisioner.createMountTargetWithRetry(ctx, "fs-12345", "subnet-12345", "sg-12345")
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if mt == nil {
+		t.Errorf("Expected mount target to be non-nil")
+	}
+	if mt.MountTargetId != "fsmt-12345" {
+		t.Errorf("Expected MountTargetId to be 'fsmt-12345', got %s", mt.MountTargetId)
+	}
+}
+
+func TestNamespaceProvisioner_createMountTargetWithRetry_AlreadyExists(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	mockCloud.createMountTargetFunc = func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+		return nil, cloud.ErrAlreadyExists
+	}
+
+	ctx := context.Background()
+	mt, err := provisioner.createMountTargetWithRetry(ctx, "fs-12345", "subnet-12345", "sg-12345")
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if mt != nil {
+		t.Errorf("Expected mount target to be nil when already exists")
+	}
+}
+
+func TestNamespaceProvisioner_createMountTargetWithRetry_MaxRetriesExceeded(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	options.MaxRetries = 2
+	options.RetryDelay = 1 * time.Millisecond // Speed up test
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	callCount := 0
+	mockCloud.createMountTargetFunc = func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+		callCount++
+		return nil, fmt.Errorf("temporary error")
+	}
+
+	ctx := context.Background()
+	mt, err := provisioner.createMountTargetWithRetry(ctx, "fs-12345", "subnet-12345", "sg-12345")
+
+	if err == nil {
+		t.Errorf("Expected error after max retries")
+	}
+	if mt != nil {
+		t.Errorf("Expected mount target to be nil when retries exceeded")
+	}
+	if callCount != 2 {
+		t.Errorf("Expected 2 retry attempts, got %d", callCount)
+	}
+	if !contains(err.Error(), "failed to create mount target after 2 attempts") {
+		t.Errorf("Expected error message to mention retry attempts, got: %s", err.Error())
+	}
+}
+
+func TestNamespaceProvisioner_getConfiguredSubnets(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	options.SubnetIds = []string{"subnet-12345", "subnet-67890", "subnet-abcdef"}
+	options.AvailabilityZones = []string{"us-east-1a", "us-east-1b"} // Fewer AZs than subnets
+	options.VpcId = "vpc-12345"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	ctx := context.Background()
+	subnets, err := provisioner.getConfiguredSubnets(ctx)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if len(subnets) != 3 {
+		t.Errorf("Expected 3 subnets, got %d", len(subnets))
+	}
+
+	// Check first subnet
+	if subnets[0].SubnetId != "subnet-12345" {
+		t.Errorf("Expected first subnet ID to be 'subnet-12345', got %s", subnets[0].SubnetId)
+	}
+	if subnets[0].AvailabilityZone != "us-east-1a" {
+		t.Errorf("Expected first AZ to be 'us-east-1a', got %s", subnets[0].AvailabilityZone)
+	}
+	if subnets[0].VpcId != "vpc-12345" {
+		t.Errorf("Expected VPC ID to be 'vpc-12345', got %s", subnets[0].VpcId)
+	}
+
+	// Check second subnet
+	if subnets[1].SubnetId != "subnet-67890" {
+		t.Errorf("Expected second subnet ID to be 'subnet-67890', got %s", subnets[1].SubnetId)
+	}
+	if subnets[1].AvailabilityZone != "us-east-1b" {
+		t.Errorf("Expected second AZ to be 'us-east-1b', got %s", subnets[1].AvailabilityZone)
+	}
+
+	// Third subnet should have empty AZ since we only have 2 AZs configured
+	if subnets[2].SubnetId != "subnet-abcdef" {
+		t.Errorf("Expected third subnet ID to be 'subnet-abcdef', got %s", subnets[2].SubnetId)
+	}
+	if subnets[2].AvailabilityZone != "" {
+		t.Errorf("Expected third AZ to be empty, got %s", subnets[2].AvailabilityZone)
+	}
+}
+
+func TestNamespaceProvisioner_getEFSSecurityGroup_Configured(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	options.SecurityGroupId = "sg-configured"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	ctx := context.Background()
+	sgId, err := provisioner.getEFSSecurityGroup(ctx)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if sgId != "sg-configured" {
+		t.Errorf("Expected security group ID to be 'sg-configured', got %s", sgId)
+	}
+}
+
+func TestNamespaceProvisioner_getEFSSecurityGroup_Default(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	// No security group configured
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	ctx := context.Background()
+	sgId, err := provisioner.getEFSSecurityGroup(ctx)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if sgId != "" {
+		t.Errorf("Expected empty security group ID (default), got %s", sgId)
+	}
+}
+
+func TestNamespaceProvisioner_discoverSubnetsFromExistingEFS_NoFileSystems(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	options.ClusterID = "test-cluster"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	// Mock FindFileSystemsByTags to return no filesystems
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{}, nil
+	}
+
+	ctx := context.Background()
+	subnets, err := provisioner.discoverSubnetsFromExistingEFS(ctx)
+
+	if err == nil {
+		t.Errorf("Expected error when no existing filesystems found")
+	}
+	if len(subnets) != 0 {
+		t.Errorf("Expected 0 subnets, got %d", len(subnets))
+	}
+	if !contains(err.Error(), "no existing EFS filesystems found") {
+		t.Errorf("Expected error message to mention no filesystems, got: %s", err.Error())
+	}
+}
+
+func TestNamespaceProvisioner_getDefaultSubnets_NoMetadata(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	// Mock GetMetadata to return nil
+	mockCloud.getMetadataFunc = func() cloud.MetadataService {
+		return nil
+	}
+
+	ctx := context.Background()
+	subnets, err := provisioner.getDefaultSubnets(ctx)
+
+	if err == nil {
+		t.Errorf("Expected error when metadata service not available")
+	}
+	if len(subnets) != 0 {
+		t.Errorf("Expected 0 subnets, got %d", len(subnets))
+	}
+	if !contains(err.Error(), "metadata service not available") {
+		t.Errorf("Expected error message to mention metadata service, got: %s", err.Error())
 	}
 }

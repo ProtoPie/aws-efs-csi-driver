@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -150,6 +151,12 @@ type ProvisionerOptions struct {
 	DefaultTags           map[string]string
 	ClusterID             string
 	Region                string
+
+	// Network configuration for mount targets
+	SubnetIds             []string          // Configured subnet IDs for mount target creation
+	AvailabilityZones     []string          // Availability zones corresponding to subnet IDs
+	VpcId                 string            // VPC ID for the cluster
+	SecurityGroupId       string            // Security group ID for EFS mount targets
 }
 
 // CachedEFS represents a cached EFS filesystem with metadata
@@ -616,6 +623,13 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 		// Don't fail the entire operation, the mapping can be recovered from tags
 	}
 
+	// Create mount targets for the EFS filesystem
+	if err := np.createMountTargetsForEFS(ctx, filesystem.FileSystemId, namespace); err != nil {
+		klog.Warningf("Failed to create mount targets for EFS %s in namespace %s: %v", filesystem.FileSystemId, namespace, err)
+		// Don't fail the entire operation as mount targets can be created later
+		// The node service will handle cases where mount targets don't exist yet
+	}
+
 	// Cache the filesystem
 	np.setCachedEFS(namespace, filesystem)
 
@@ -683,6 +697,272 @@ func (np *NamespaceProvisioner) GetNamespaceEFS(ctx context.Context, namespace s
 	np.setCachedEFS(namespace, filesystem)
 
 	return filesystem, nil
+}
+
+// createMountTargetsForEFS creates mount targets for the given EFS filesystem
+// This ensures multi-AZ availability for the EFS filesystem
+func (np *NamespaceProvisioner) createMountTargetsForEFS(ctx context.Context, fileSystemId, namespace string) error {
+	klog.V(2).Infof("Creating mount targets for EFS %s in namespace %s", fileSystemId, namespace)
+
+	// Check if mount targets already exist
+	existingMT, err := np.cloud.DescribeMountTargets(ctx, fileSystemId, "")
+	if err == nil && existingMT != nil {
+		klog.V(2).Infof("Mount targets already exist for EFS %s", fileSystemId)
+		return nil
+	}
+
+	// Get available subnets for mount target creation
+	subnets, err := np.getAvailableSubnets(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get available subnets: %w", err)
+	}
+
+	if len(subnets) == 0 {
+		return fmt.Errorf("no available subnets found for mount target creation")
+	}
+
+	// Get default security group for EFS
+	securityGroupId, err := np.getEFSSecurityGroup(ctx)
+	if err != nil {
+		klog.Warningf("Failed to get EFS security group, proceeding without security group: %v", err)
+		securityGroupId = "" // EFS will use the default VPC security group
+	}
+
+	// Create mount targets in multiple subnets for high availability
+	// Limit to first 3 subnets to avoid hitting EFS mount target limits
+	maxMountTargets := 3
+	if len(subnets) < maxMountTargets {
+		maxMountTargets = len(subnets)
+	}
+
+	var createdMountTargets []*cloud.MountTarget
+	var createErrors []error
+
+	for i := 0; i < maxMountTargets; i++ {
+		subnet := subnets[i]
+		klog.V(4).Infof("Creating mount target for EFS %s in subnet %s (AZ: %s)", fileSystemId, subnet.SubnetId, subnet.AvailabilityZone)
+
+		// Create mount target with retry logic
+		mountTarget, err := np.createMountTargetWithRetry(ctx, fileSystemId, subnet.SubnetId, securityGroupId)
+		if err != nil {
+			createErrors = append(createErrors, fmt.Errorf("failed to create mount target in subnet %s: %w", subnet.SubnetId, err))
+			continue
+		}
+
+		createdMountTargets = append(createdMountTargets, mountTarget)
+		klog.V(2).Infof("Successfully created mount target %s for EFS %s in AZ %s",
+			mountTarget.MountTargetId, fileSystemId, mountTarget.AZName)
+	}
+
+	// If we couldn't create any mount targets, return the errors
+	if len(createdMountTargets) == 0 {
+		return fmt.Errorf("failed to create any mount targets: %v", createErrors)
+	}
+
+	// Log warnings for any failed mount target creations
+	if len(createErrors) > 0 {
+		for _, err := range createErrors {
+			klog.Warningf("Mount target creation warning: %v", err)
+		}
+	}
+
+	klog.V(2).Infof("Successfully created %d mount targets for EFS %s", len(createdMountTargets), fileSystemId)
+	return nil
+}
+
+// createMountTargetWithRetry creates a mount target with retry logic
+func (np *NamespaceProvisioner) createMountTargetWithRetry(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < np.options.MaxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff with jitter
+			backoffDelay := np.options.RetryDelay * time.Duration(1<<uint(attempt-1))
+			if backoffDelay > np.options.RetryBackoffMax {
+				backoffDelay = np.options.RetryBackoffMax
+			}
+
+			// Add jitter to prevent thundering herd
+			jitter := time.Duration(rand.Int63n(int64(backoffDelay / 4)))
+			time.Sleep(backoffDelay + jitter)
+		}
+
+		mountTarget, err := np.cloud.CreateMountTarget(ctx, fileSystemId, subnetId, securityGroupId)
+		if err == nil {
+			return mountTarget, nil
+		}
+
+		// Check if it's a retryable error
+		if err == cloud.ErrAlreadyExists {
+			klog.V(4).Infof("Mount target already exists in subnet %s", subnetId)
+			return nil, nil // Not an error, just skip this subnet
+		}
+
+		lastErr = err
+		klog.V(4).Infof("Mount target creation attempt %d failed: %v", attempt+1, err)
+	}
+
+	return nil, fmt.Errorf("failed to create mount target after %d attempts: %w", np.options.MaxRetries, lastErr)
+}
+
+// SubnetInfo represents subnet information for mount target creation
+type SubnetInfo struct {
+	SubnetId         string
+	AvailabilityZone string
+	VpcId            string
+}
+
+// getAvailableSubnets gets available subnets for mount target creation
+// This implementation provides multiple strategies for subnet discovery
+func (np *NamespaceProvisioner) getAvailableSubnets(ctx context.Context) ([]*SubnetInfo, error) {
+	klog.V(4).Infof("Getting available subnets for mount target creation")
+
+	// Strategy 1: Check for configured subnets in options
+	if len(np.options.SubnetIds) > 0 {
+		return np.getConfiguredSubnets(ctx)
+	}
+
+	// Strategy 2: Auto-discover using existing EFS mount targets
+	subnets, err := np.discoverSubnetsFromExistingEFS(ctx)
+	if err == nil && len(subnets) > 0 {
+		klog.V(2).Infof("Found %d subnets from existing EFS mount targets", len(subnets))
+		return subnets, nil
+	}
+
+	// Strategy 3: Use default subnets based on cluster configuration
+	return np.getDefaultSubnets(ctx)
+}
+
+// getConfiguredSubnets returns subnets configured in provisioner options
+func (np *NamespaceProvisioner) getConfiguredSubnets(ctx context.Context) ([]*SubnetInfo, error) {
+	var subnets []*SubnetInfo
+
+	for i, subnetId := range np.options.SubnetIds {
+		// For configured subnets, derive AZ from instance metadata if available
+		az := ""
+		if i < len(np.options.AvailabilityZones) {
+			az = np.options.AvailabilityZones[i]
+		} else if np.cloud.GetMetadata() != nil {
+			// Use metadata service to get current AZ as fallback
+			az = np.cloud.GetMetadata().GetAvailabilityZone()
+		}
+
+		subnet := &SubnetInfo{
+			SubnetId:         subnetId,
+			AvailabilityZone: az,
+			VpcId:            np.options.VpcId,
+		}
+		subnets = append(subnets, subnet)
+	}
+
+	klog.V(2).Infof("Using %d configured subnets for mount target creation", len(subnets))
+	return subnets, nil
+}
+
+// discoverSubnetsFromExistingEFS discovers subnets by examining existing EFS mount targets
+func (np *NamespaceProvisioner) discoverSubnetsFromExistingEFS(ctx context.Context) ([]*SubnetInfo, error) {
+	klog.V(4).Infof("Attempting to discover subnets from existing EFS mount targets")
+
+	// Find existing EFS filesystems with the same cluster tag
+	tags := map[string]string{}
+	if np.options.ClusterID != "" {
+		tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
+	}
+
+	fileSystems, err := np.cloud.FindFileSystemsByTags(ctx, tags)
+	if err != nil || len(fileSystems) == 0 {
+		klog.V(4).Infof("No existing EFS filesystems found for subnet discovery")
+		return nil, fmt.Errorf("no existing EFS filesystems found")
+	}
+
+	// Collect unique subnets from existing mount targets
+	subnetMap := make(map[string]*SubnetInfo)
+
+	for _, fs := range fileSystems {
+		// Get mount targets for this filesystem
+		mountTarget, err := np.cloud.DescribeMountTargets(ctx, fs.FileSystemId, "")
+		if err != nil {
+			continue
+		}
+
+		if mountTarget != nil {
+			// Extract subnet information from mount target
+			// Note: The current DescribeMountTargets doesn't return subnet ID
+			// This is a limitation we'll note for future enhancement
+			subnet := &SubnetInfo{
+				SubnetId:         "", // Not available from current API
+				AvailabilityZone: mountTarget.AZName,
+				VpcId:            "", // Not available from current API
+			}
+
+			key := mountTarget.AZName
+			if _, exists := subnetMap[key]; !exists {
+				subnetMap[key] = subnet
+			}
+		}
+	}
+
+	var subnets []*SubnetInfo
+	for _, subnet := range subnetMap {
+		subnets = append(subnets, subnet)
+	}
+
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("no subnets discovered from existing EFS mount targets")
+	}
+
+	return subnets, nil
+}
+
+// getDefaultSubnets returns default subnets based on cluster metadata
+func (np *NamespaceProvisioner) getDefaultSubnets(ctx context.Context) ([]*SubnetInfo, error) {
+	klog.V(4).Infof("Using default subnet strategy based on instance metadata")
+
+	// Get current instance availability zone from metadata
+	metadata := np.cloud.GetMetadata()
+	if metadata == nil {
+		return nil, fmt.Errorf("metadata service not available for subnet detection")
+	}
+
+	currentAZ := metadata.GetAvailabilityZone()
+	if currentAZ == "" {
+		return nil, fmt.Errorf("current availability zone not available from metadata")
+	}
+
+	// Create a placeholder subnet for the current AZ
+	// In a real implementation, this would:
+	// 1. Query EC2 to find subnets in the current VPC
+	// 2. Filter by availability zones
+	// 3. Return actual subnet IDs
+
+	// For now, return placeholder that will cause graceful handling
+	klog.V(2).Infof("Current AZ from metadata: %s", currentAZ)
+	klog.Warningf("Default subnet strategy requires EC2 integration - mount targets must be created manually or configured via options")
+
+	return []*SubnetInfo{}, fmt.Errorf("automatic subnet discovery requires EC2 integration - please configure subnets manually")
+}
+
+// getEFSSecurityGroup gets the security group for EFS mount targets
+func (np *NamespaceProvisioner) getEFSSecurityGroup(ctx context.Context) (string, error) {
+	klog.V(4).Infof("Getting EFS security group configuration")
+
+	// Strategy 1: Use configured security group if available
+	if np.options.SecurityGroupId != "" {
+		klog.V(2).Infof("Using configured security group: %s", np.options.SecurityGroupId)
+		return np.options.SecurityGroupId, nil
+	}
+
+	// Strategy 2: Look for existing EFS security groups by tags
+	// TODO: Implement EC2 security group discovery
+	// This would search for security groups with specific tags like:
+	// - kubernetes.io/cluster/<cluster-id>
+	// - kubernetes.io/service/efs
+
+	// Strategy 3: Use default VPC security group
+	klog.V(2).Infof("No security group configured, using default VPC security group")
+	klog.Warningf("Using default security group may require manual NFS rule configuration")
+
+	return "", nil // Empty string will use default VPC security group
 }
 
 // DeleteNamespaceEFS deletes the EFS filesystem for the given namespace

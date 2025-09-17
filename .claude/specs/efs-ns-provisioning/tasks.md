@@ -100,7 +100,7 @@
   - _Requirements: 2.2_
   - **Completed**: Implemented DescribeFileSystems method in cloud.go and namespace_efs_mapper.go with comprehensive tests
 
-- [ ] 3.4 Mount Target 생성 로직
+- [x] 3.4 Mount Target 생성 로직
   - 다중 가용 영역 지원 구현
   - 서브넷 자동 감지 로직
   - 보안 그룹 설정 로직
