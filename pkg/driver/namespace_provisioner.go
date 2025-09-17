@@ -28,8 +28,11 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/uuid"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
@@ -53,6 +56,23 @@ const (
 	DefaultGid              = 1001
 	DefaultGidRangeStart    = 1000
 	DefaultGidRangeEnd      = 2000
+
+	// Volume status tracking constants
+	StatusCheckInterval     = 5 * time.Second
+	StatusEventSource       = "aws-efs-csi-driver"
+	EventReasonProvisioning = "Provisioning"
+	EventReasonProvisioned  = "Provisioned"
+	EventReasonProvisioningFailed = "ProvisioningFailed"
+	EventReasonDeleting     = "Deleting"
+	EventReasonDeleted      = "Deleted"
+	EventReasonDeletionFailed = "DeletionFailed"
+	EventReasonEFSCreating  = "EFSCreating"
+	EventReasonEFSCreated   = "EFSCreated"
+	EventReasonEFSReused    = "EFSReused"
+	EventReasonAccessPointCreating = "AccessPointCreating"
+	EventReasonAccessPointCreated  = "AccessPointCreated"
+	EventReasonMountTargetsCreating = "MountTargetsCreating"
+	EventReasonMountTargetsCreated  = "MountTargetsCreated"
 )
 
 // EFSOptions contains options for creating EFS filesystems
@@ -80,6 +100,70 @@ type AccessPointCreationOptions struct {
 	GidRangeEnd           *int64
 	ReuseAccessPoint      bool
 	Tags                  map[string]string
+}
+
+// VolumeStatus represents the current status of a volume being provisioned
+type VolumeStatus struct {
+	VolumeID            string
+	PVCName             string
+	Namespace           string
+	Phase               VolumePhase
+	Message             string
+	Reason              string
+	StartTime           time.Time
+	LastUpdateTime      time.Time
+	EFSFileSystemID     string
+	AccessPointID       string
+	Error               error
+	RetryCount          int
+	ProgressPercentage  int
+	Operations          []VolumeOperation
+}
+
+// VolumePhase represents the phase of volume provisioning
+type VolumePhase string
+
+const (
+	VolumePhaseInitializing     VolumePhase = "Initializing"
+	VolumePhaseEFSCreating      VolumePhase = "EFSCreating"
+	VolumePhaseEFSCreated       VolumePhase = "EFSCreated"
+	VolumePhaseEFSReused        VolumePhase = "EFSReused"
+	VolumePhaseMountTargets     VolumePhase = "MountTargetsCreating"
+	VolumePhaseAccessPoint      VolumePhase = "AccessPointCreating"
+	VolumePhaseCompleted        VolumePhase = "Completed"
+	VolumePhaseFailed          VolumePhase = "Failed"
+	VolumePhaseDeleting        VolumePhase = "Deleting"
+	VolumePhaseDeleted         VolumePhase = "Deleted"
+)
+
+// VolumeOperation represents an operation performed during volume provisioning
+type VolumeOperation struct {
+	Operation   string
+	StartTime   time.Time
+	EndTime     *time.Time
+	Status      string
+	Message     string
+	Error       error
+}
+
+// VolumeStatusTracker manages the status of volume operations
+type VolumeStatusTracker struct {
+	statuses     map[string]*VolumeStatus
+	statusLock   sync.RWMutex
+	eventRecorder record.EventRecorder
+	k8sClient    kubernetes.Interface
+}
+
+// VolumeProgressEvent represents a progress event during volume provisioning
+type VolumeProgressEvent struct {
+	VolumeID    string
+	PVCName     string
+	Namespace   string
+	EventType   string
+	Reason      string
+	Message     string
+	Progress    int
+	Timestamp   time.Time
 }
 
 // NamespaceProvisionerInterface defines the interface for namespace-level EFS provisioning
@@ -139,6 +223,9 @@ type NamespaceProvisioner struct {
 	// Cache for performance optimization
 	efsCache    map[string]*CachedEFS
 	cacheMutex  sync.RWMutex
+
+	// Volume status tracking
+	statusTracker *VolumeStatusTracker
 
 	// Lifecycle management
 	started    bool
@@ -243,6 +330,9 @@ func NewNamespaceProvisioner(cloud cloud.Cloud, k8sClient kubernetes.Interface, 
 	// Initialize lock manager
 	lockManager := NewLockManagerMap()
 
+	// Initialize volume status tracker
+	statusTracker := NewVolumeStatusTracker(nil, k8sClient) // EventRecorder will be set later
+
 	provisioner := &NamespaceProvisioner{
 		cloud:       cloud,
 		k8sClient:   k8sClient,
@@ -256,6 +346,7 @@ func NewNamespaceProvisioner(cloud cloud.Cloud, k8sClient kubernetes.Interface, 
 			LastHealthCheck: time.Now(),
 		},
 		efsCache:         make(map[string]*CachedEFS),
+		statusTracker:    statusTracker,
 		stopCh:           make(chan struct{}),
 		metricsCollector: metricsCollector,
 	}
@@ -1023,18 +1114,7 @@ func (np *NamespaceProvisioner) DeleteNamespaceVolume(ctx context.Context, req *
 
 	klog.V(2).Infof("Deleting namespace volume with Access Point ID: %s", accessPointId)
 
-	// Acquire lock to prevent concurrent operations on the same Access Point
-	lockKey := fmt.Sprintf("accesspoint-delete:%s", accessPointId)
-	if !np.lockManager.lockMutex(lockKey, np.options.DeleteTimeout) {
-		err := fmt.Errorf("failed to acquire lock for deleting Access Point %s within timeout", accessPointId)
-		np.metricsCollector.RecordError("acquire_delete_lock", "unknown", err)
-		return nil, err
-	}
-	defer func() {
-		np.lockManager.unlockMutex(lockKey)
-	}()
-
-	// Get Access Point details to extract namespace and PVC information
+	// Get Access Point details first to extract namespace and PVC information for status tracking
 	accessPoint, err := np.cloud.DescribeAccessPoint(ctx, accessPointId)
 	if err != nil {
 		if err == cloud.ErrNotFound {
@@ -1054,30 +1134,60 @@ func (np *NamespaceProvisioner) DeleteNamespaceVolume(ctx context.Context, req *
 		pvcName = "unknown"
 	}
 
+	// Start volume deletion tracking
+	np.statusTracker.StartVolumeDeletion(volumeId, pvcName, namespace)
+
+	// Helper function to handle errors with status tracking
+	handleError := func(err error, message string) (*csi.DeleteVolumeResponse, error) {
+		np.statusTracker.FailVolumeDeletion(volumeId, err)
+		np.metricsCollector.RecordError("delete_namespace_volume", namespace, err)
+		return nil, err
+	}
+
+	// Acquire lock to prevent concurrent operations on the same Access Point
+	lockKey := fmt.Sprintf("accesspoint-delete:%s", accessPointId)
+	if !np.lockManager.lockMutex(lockKey, np.options.DeleteTimeout) {
+		err := fmt.Errorf("failed to acquire lock for deleting Access Point %s within timeout", accessPointId)
+		return handleError(err, "Failed to acquire deletion lock")
+	}
+	defer func() {
+		np.lockManager.unlockMutex(lockKey)
+	}()
+
 	klog.V(2).Infof("Deleting Access Point %s for PVC %s in namespace %s", accessPointId, pvcName, namespace)
 
 	// Delete the Access Point
+	np.statusTracker.RecordVolumeOperation(volumeId, "delete_access_point", "started", fmt.Sprintf("Deleting Access Point %s", accessPointId), nil)
 	if err := np.cloud.DeleteAccessPoint(ctx, accessPointId); err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(2).Infof("Access Point %s not found - assuming already deleted", accessPointId)
+			np.statusTracker.RecordVolumeOperation(volumeId, "delete_access_point", "completed", "Access Point already deleted", nil)
 		} else {
-			np.metricsCollector.RecordError("delete_accesspoint", namespace, err)
-			return nil, fmt.Errorf("failed to delete Access Point %s: %w", accessPointId, err)
+			np.statusTracker.RecordVolumeOperation(volumeId, "delete_access_point", "failed", "Failed to delete Access Point", err)
+			return handleError(fmt.Errorf("failed to delete Access Point %s: %w", accessPointId, err), "Failed to delete Access Point")
 		}
 	} else {
 		// Record successful deletion metrics
 		np.metricsCollector.IncAccessPointDeleted(namespace)
+		np.statusTracker.RecordVolumeOperation(volumeId, "delete_access_point", "completed", "Access Point deleted successfully", nil)
 		klog.V(2).Infof("Successfully deleted Access Point %s for PVC %s in namespace %s", accessPointId, pvcName, namespace)
 	}
 
 	// Check if this was the last Access Point in the namespace
 	// and handle EFS cleanup according to cleanup policy
 	if namespace != "unknown" {
+		np.statusTracker.RecordVolumeOperation(volumeId, "namespace_cleanup", "started", "Checking for namespace cleanup", nil)
 		if err := np.handleNamespaceCleanup(ctx, namespace, accessPointId); err != nil {
 			klog.Warningf("Failed to handle namespace cleanup for %s: %v", namespace, err)
+			np.statusTracker.RecordVolumeOperation(volumeId, "namespace_cleanup", "warning", "Namespace cleanup had issues", err)
 			// Don't fail the entire operation for cleanup issues
+		} else {
+			np.statusTracker.RecordVolumeOperation(volumeId, "namespace_cleanup", "completed", "Namespace cleanup completed", nil)
 		}
 	}
+
+	// Complete volume deletion tracking
+	np.statusTracker.CompleteVolumeDeletion(volumeId)
 
 	return &csi.DeleteVolumeResponse{}, nil
 }
@@ -1595,40 +1705,63 @@ func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *
 		return nil, fmt.Errorf("failed to extract namespace: %w", err)
 	}
 
-	// Parse EFS options from volume parameters
-	efsOptions, err := np.parseEFSOptionsFromParams(volumeParams)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse EFS options: %w", err)
-	}
-
-	// Parse Access Point options from volume parameters
-	apOptions, err := np.parseAccessPointOptionsFromParams(volumeParams, namespace, volName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Access Point options: %w", err)
-	}
-
-	// Ensure namespace EFS exists (create if necessary)
-	fileSystem, err := np.ensureNamespaceEFS(ctx, namespace, efsOptions)
-	if err != nil {
-		np.metricsCollector.RecordError("create_namespace_efs", namespace, err)
-		return nil, fmt.Errorf("failed to ensure namespace EFS: %w", err)
-	}
-
-	// Extract PVC name for Access Point creation
+	// Extract PVC name for tracking and Access Point creation
 	pvcName, err := np.extractPVCNameFromRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract PVC name: %w", err)
 	}
 
+	// Start volume status tracking
+	volumeID := volName
+	np.statusTracker.StartVolumeProvisioning(volumeID, pvcName, namespace)
+
+	// Helper function to handle errors with status tracking
+	handleError := func(err error, phase VolumePhase, message string) (*csi.CreateVolumeResponse, error) {
+		np.statusTracker.FailVolumeProvisioning(volumeID, err, 0)
+		np.metricsCollector.RecordError("create_namespace_volume", namespace, err)
+		return nil, err
+	}
+
+	// Parse EFS options from volume parameters
+	np.statusTracker.UpdateVolumePhase(volumeID, VolumePhaseInitializing, "Parsing volume parameters", 10)
+	efsOptions, err := np.parseEFSOptionsFromParams(volumeParams)
+	if err != nil {
+		return handleError(fmt.Errorf("failed to parse EFS options: %w", err), VolumePhaseFailed, "Failed to parse EFS options")
+	}
+
+	// Parse Access Point options from volume parameters
+	apOptions, err := np.parseAccessPointOptionsFromParams(volumeParams, namespace, volName)
+	if err != nil {
+		return handleError(fmt.Errorf("failed to parse Access Point options: %w", err), VolumePhaseFailed, "Failed to parse Access Point options")
+	}
+
+	// Ensure namespace EFS exists (create if necessary)
+	np.statusTracker.UpdateVolumePhase(volumeID, VolumePhaseEFSCreating, "Ensuring namespace EFS exists", 25)
+	np.statusTracker.RecordVolumeOperation(volumeID, "ensure_namespace_efs", "started", "Checking for existing EFS or creating new one", nil)
+
+	fileSystem, err := np.ensureNamespaceEFS(ctx, namespace, efsOptions)
+	if err != nil {
+		np.statusTracker.RecordVolumeOperation(volumeID, "ensure_namespace_efs", "failed", "Failed to ensure namespace EFS", err)
+		return handleError(fmt.Errorf("failed to ensure namespace EFS: %w", err), VolumePhaseFailed, "Failed to ensure namespace EFS")
+	}
+
+	np.statusTracker.RecordVolumeOperation(volumeID, "ensure_namespace_efs", "completed", fmt.Sprintf("EFS %s ready", fileSystem.FileSystemId), nil)
+	np.statusTracker.UpdateVolumePhase(volumeID, VolumePhaseEFSCreated, fmt.Sprintf("EFS %s ready", fileSystem.FileSystemId), 60)
+
 	// Update Access Point options with the correct filesystem ID
 	apOptions.FileSystemId = fileSystem.FileSystemId
 
 	// Create Access Point for this PVC
+	np.statusTracker.UpdateVolumePhase(volumeID, VolumePhaseAccessPoint, "Creating Access Point", 80)
+	np.statusTracker.RecordVolumeOperation(volumeID, "create_access_point", "started", fmt.Sprintf("Creating Access Point for PVC %s", pvcName), nil)
+
 	accessPoint, err := np.CreateAccessPointForPVC(ctx, pvcName, namespace, apOptions)
 	if err != nil {
-		np.metricsCollector.RecordError("create_access_point", namespace, err)
-		return nil, fmt.Errorf("failed to create Access Point for PVC %s: %w", pvcName, err)
+		np.statusTracker.RecordVolumeOperation(volumeID, "create_access_point", "failed", "Failed to create Access Point", err)
+		return handleError(fmt.Errorf("failed to create Access Point for PVC %s: %w", pvcName, err), VolumePhaseFailed, "Failed to create Access Point")
 	}
+
+	np.statusTracker.RecordVolumeOperation(volumeID, "create_access_point", "completed", fmt.Sprintf("Access Point %s created", accessPoint.AccessPointId), nil)
 
 	// Get volume size from request
 	volSize := req.GetCapacityRange().GetRequiredBytes()
@@ -1659,6 +1792,9 @@ func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *
 			VolumeContext: volumeContext,
 		},
 	}
+
+	// Complete volume provisioning tracking
+	np.statusTracker.CompleteVolumeProvisioning(volumeID, fileSystem.FileSystemId, accessPoint.AccessPointId)
 
 	klog.V(2).Infof("Successfully created namespace volume %s for PVC %s in namespace %s (EFS: %s, AP: %s)",
 		volName, pvcName, namespace, fileSystem.FileSystemId, accessPoint.AccessPointId)
@@ -1841,6 +1977,333 @@ func (np *NamespaceProvisioner) isSensitiveParameter(key string) bool {
 	}
 
 	return false
+}
+
+// NewVolumeStatusTracker creates a new VolumeStatusTracker
+func NewVolumeStatusTracker(eventRecorder record.EventRecorder, k8sClient kubernetes.Interface) *VolumeStatusTracker {
+	return &VolumeStatusTracker{
+		statuses:      make(map[string]*VolumeStatus),
+		eventRecorder: eventRecorder,
+		k8sClient:     k8sClient,
+	}
+}
+
+// StartVolumeProvisioning starts tracking a new volume provisioning operation
+func (vst *VolumeStatusTracker) StartVolumeProvisioning(volumeID, pvcName, namespace string) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status := &VolumeStatus{
+		VolumeID:           volumeID,
+		PVCName:            pvcName,
+		Namespace:          namespace,
+		Phase:              VolumePhaseInitializing,
+		Message:            "Starting volume provisioning",
+		Reason:             EventReasonProvisioning,
+		StartTime:          time.Now(),
+		LastUpdateTime:     time.Now(),
+		ProgressPercentage: 0,
+		Operations:         []VolumeOperation{},
+	}
+
+	vst.statuses[volumeID] = status
+	vst.emitProgressEvent(status, corev1.EventTypeNormal, EventReasonProvisioning, "Starting volume provisioning")
+	klog.V(2).Infof("Started volume provisioning tracking for PVC %s/%s (volume: %s)", namespace, pvcName, volumeID)
+}
+
+// UpdateVolumePhase updates the phase of a volume provisioning operation
+func (vst *VolumeStatusTracker) UpdateVolumePhase(volumeID string, phase VolumePhase, message string, progressPercentage int) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to update non-existent volume status: %s", volumeID)
+		return
+	}
+
+	oldPhase := status.Phase
+	status.Phase = phase
+	status.Message = message
+	status.LastUpdateTime = time.Now()
+	status.ProgressPercentage = progressPercentage
+
+	// Determine event type and reason based on phase
+	eventType := corev1.EventTypeNormal
+	reason := string(phase)
+
+	switch phase {
+	case VolumePhaseEFSCreating:
+		reason = EventReasonEFSCreating
+	case VolumePhaseEFSCreated:
+		reason = EventReasonEFSCreated
+	case VolumePhaseEFSReused:
+		reason = EventReasonEFSReused
+	case VolumePhaseMountTargets:
+		reason = EventReasonMountTargetsCreating
+	case VolumePhaseAccessPoint:
+		reason = EventReasonAccessPointCreating
+	case VolumePhaseCompleted:
+		reason = EventReasonProvisioned
+	case VolumePhaseFailed:
+		eventType = corev1.EventTypeWarning
+		reason = EventReasonProvisioningFailed
+	case VolumePhaseDeleting:
+		reason = EventReasonDeleting
+	case VolumePhaseDeleted:
+		reason = EventReasonDeleted
+	}
+
+	vst.emitProgressEvent(status, eventType, reason, message)
+	klog.V(3).Infof("Updated volume %s phase: %s -> %s (progress: %d%%, message: %s)",
+		volumeID, oldPhase, phase, progressPercentage, message)
+}
+
+// RecordVolumeOperation records an operation performed during volume provisioning
+func (vst *VolumeStatusTracker) RecordVolumeOperation(volumeID, operation, status, message string, err error) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	volumeStatus, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to record operation for non-existent volume: %s", volumeID)
+		return
+	}
+
+	now := time.Now()
+	op := VolumeOperation{
+		Operation: operation,
+		StartTime: now,
+		Status:    status,
+		Message:   message,
+		Error:     err,
+	}
+
+	if status == "completed" || status == "failed" {
+		op.EndTime = &now
+	}
+
+	volumeStatus.Operations = append(volumeStatus.Operations, op)
+	klog.V(4).Infof("Recorded operation for volume %s: %s - %s (%s)", volumeID, operation, status, message)
+}
+
+// CompleteVolumeProvisioning marks a volume provisioning operation as completed
+func (vst *VolumeStatusTracker) CompleteVolumeProvisioning(volumeID, efsID, accessPointID string) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to complete non-existent volume provisioning: %s", volumeID)
+		return
+	}
+
+	status.Phase = VolumePhaseCompleted
+	status.Message = "Volume provisioning completed successfully"
+	status.Reason = EventReasonProvisioned
+	status.LastUpdateTime = time.Now()
+	status.EFSFileSystemID = efsID
+	status.AccessPointID = accessPointID
+	status.ProgressPercentage = 100
+
+	vst.emitProgressEvent(status, corev1.EventTypeNormal, EventReasonProvisioned, status.Message)
+	klog.V(2).Infof("Completed volume provisioning for PVC %s/%s (volume: %s, EFS: %s, AP: %s)",
+		status.Namespace, status.PVCName, volumeID, efsID, accessPointID)
+}
+
+// FailVolumeProvisioning marks a volume provisioning operation as failed
+func (vst *VolumeStatusTracker) FailVolumeProvisioning(volumeID string, err error, retryCount int) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to fail non-existent volume provisioning: %s", volumeID)
+		return
+	}
+
+	status.Phase = VolumePhaseFailed
+	status.Message = fmt.Sprintf("Volume provisioning failed: %v", err)
+	status.Reason = EventReasonProvisioningFailed
+	status.LastUpdateTime = time.Now()
+	status.Error = err
+	status.RetryCount = retryCount
+
+	vst.emitProgressEvent(status, corev1.EventTypeWarning, EventReasonProvisioningFailed, status.Message)
+	klog.Errorf("Failed volume provisioning for PVC %s/%s (volume: %s, retry: %d): %v",
+		status.Namespace, status.PVCName, volumeID, retryCount, err)
+}
+
+// StartVolumeDeletion starts tracking a volume deletion operation
+func (vst *VolumeStatusTracker) StartVolumeDeletion(volumeID, pvcName, namespace string) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status := &VolumeStatus{
+		VolumeID:           volumeID,
+		PVCName:            pvcName,
+		Namespace:          namespace,
+		Phase:              VolumePhaseDeleting,
+		Message:            "Starting volume deletion",
+		Reason:             EventReasonDeleting,
+		StartTime:          time.Now(),
+		LastUpdateTime:     time.Now(),
+		ProgressPercentage: 0,
+		Operations:         []VolumeOperation{},
+	}
+
+	vst.statuses[volumeID] = status
+	vst.emitProgressEvent(status, corev1.EventTypeNormal, EventReasonDeleting, "Starting volume deletion")
+	klog.V(2).Infof("Started volume deletion tracking for PVC %s/%s (volume: %s)", namespace, pvcName, volumeID)
+}
+
+// CompleteVolumeDeletion marks a volume deletion operation as completed
+func (vst *VolumeStatusTracker) CompleteVolumeDeletion(volumeID string) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to complete non-existent volume deletion: %s", volumeID)
+		return
+	}
+
+	status.Phase = VolumePhaseDeleted
+	status.Message = "Volume deletion completed successfully"
+	status.Reason = EventReasonDeleted
+	status.LastUpdateTime = time.Now()
+	status.ProgressPercentage = 100
+
+	vst.emitProgressEvent(status, corev1.EventTypeNormal, EventReasonDeleted, status.Message)
+	klog.V(2).Infof("Completed volume deletion for PVC %s/%s (volume: %s)",
+		status.Namespace, status.PVCName, volumeID)
+
+	// Clean up the status after successful deletion
+	delete(vst.statuses, volumeID)
+}
+
+// FailVolumeDeletion marks a volume deletion operation as failed
+func (vst *VolumeStatusTracker) FailVolumeDeletion(volumeID string, err error) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		klog.Warningf("Attempted to fail non-existent volume deletion: %s", volumeID)
+		return
+	}
+
+	status.Message = fmt.Sprintf("Volume deletion failed: %v", err)
+	status.Reason = EventReasonDeletionFailed
+	status.LastUpdateTime = time.Now()
+	status.Error = err
+
+	vst.emitProgressEvent(status, corev1.EventTypeWarning, EventReasonDeletionFailed, status.Message)
+	klog.Errorf("Failed volume deletion for PVC %s/%s (volume: %s): %v",
+		status.Namespace, status.PVCName, volumeID, err)
+}
+
+// GetVolumeStatus returns the current status of a volume
+func (vst *VolumeStatusTracker) GetVolumeStatus(volumeID string) (*VolumeStatus, bool) {
+	vst.statusLock.RLock()
+	defer vst.statusLock.RUnlock()
+
+	status, exists := vst.statuses[volumeID]
+	if !exists {
+		return nil, false
+	}
+
+	// Return a copy to avoid race conditions
+	statusCopy := *status
+	statusCopy.Operations = make([]VolumeOperation, len(status.Operations))
+	copy(statusCopy.Operations, status.Operations)
+
+	return &statusCopy, true
+}
+
+// ListVolumeStatuses returns all tracked volume statuses
+func (vst *VolumeStatusTracker) ListVolumeStatuses() map[string]*VolumeStatus {
+	vst.statusLock.RLock()
+	defer vst.statusLock.RUnlock()
+
+	result := make(map[string]*VolumeStatus)
+	for id, status := range vst.statuses {
+		statusCopy := *status
+		statusCopy.Operations = make([]VolumeOperation, len(status.Operations))
+		copy(statusCopy.Operations, status.Operations)
+		result[id] = &statusCopy
+	}
+
+	return result
+}
+
+// CleanupCompletedStatuses removes completed or old failed statuses
+func (vst *VolumeStatusTracker) CleanupCompletedStatuses(maxAge time.Duration) {
+	vst.statusLock.Lock()
+	defer vst.statusLock.Unlock()
+
+	cutoff := time.Now().Add(-maxAge)
+	var removed []string
+
+	for id, status := range vst.statuses {
+		shouldRemove := false
+
+		// Remove completed statuses that are old enough
+		if status.Phase == VolumePhaseCompleted && status.LastUpdateTime.Before(cutoff) {
+			shouldRemove = true
+		}
+
+		// Remove very old failed statuses
+		if status.Phase == VolumePhaseFailed && status.LastUpdateTime.Before(cutoff) {
+			shouldRemove = true
+		}
+
+		if shouldRemove {
+			delete(vst.statuses, id)
+			removed = append(removed, id)
+		}
+	}
+
+	if len(removed) > 0 {
+		klog.V(4).Infof("Cleaned up %d old volume statuses: %v", len(removed), removed)
+	}
+}
+
+// emitProgressEvent emits a Kubernetes event for volume progress
+func (vst *VolumeStatusTracker) emitProgressEvent(status *VolumeStatus, eventType, reason, message string) {
+	if vst.eventRecorder == nil {
+		klog.V(4).Infof("No event recorder available, skipping event: %s/%s - %s: %s",
+			status.Namespace, status.PVCName, reason, message)
+		return
+	}
+
+	// Try to get the PVC object to attach the event to
+	pvc, err := vst.k8sClient.CoreV1().PersistentVolumeClaims(status.Namespace).Get(
+		context.TODO(), status.PVCName, metav1.GetOptions{})
+	if err != nil {
+		klog.V(4).Infof("Could not get PVC %s/%s for event emission: %v",
+			status.Namespace, status.PVCName, err)
+		return
+	}
+
+	// Create enhanced message with progress information
+	enhancedMessage := message
+	if status.ProgressPercentage > 0 {
+		enhancedMessage = fmt.Sprintf("%s (progress: %d%%)", message, status.ProgressPercentage)
+	}
+
+	// Add operation details if available
+	if len(status.Operations) > 0 {
+		lastOp := status.Operations[len(status.Operations)-1]
+		if lastOp.Operation != "" {
+			enhancedMessage = fmt.Sprintf("%s - %s", enhancedMessage, lastOp.Operation)
+		}
+	}
+
+	// Emit the event
+	vst.eventRecorder.Event(pvc, eventType, reason, enhancedMessage)
+	klog.V(3).Infof("Emitted event for PVC %s/%s: %s - %s: %s",
+		status.Namespace, status.PVCName, eventType, reason, enhancedMessage)
 }
 
 // NoOpMetricsCollector is a no-op implementation of MetricsCollector

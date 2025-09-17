@@ -143,11 +143,12 @@
   - 정리 정책 적용 로직
   - _Requirements: 2.5_
 
-- [ ] 4.3 볼륨 상태 추적 구현
+- [x] 4.3 볼륨 상태 추적 구현
   - PVC 상태 모니터링
   - 진행 상황 이벤트 발생
   - 오류 상태 처리
   - _Requirements: 2.2_
+  - _Completed: Implemented comprehensive volume status tracking with VolumeStatusTracker including PVC status monitoring, progress event generation, error state handling, and comprehensive unit tests covering all scenarios_
 
 ### 5. 동시성 제어 및 락 관리
 - [ ] 5.1 NamespaceLockManager 구현
