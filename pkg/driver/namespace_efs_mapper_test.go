@@ -29,7 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 
 	efsv1alpha1 "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/apis/efs/v1alpha1"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
@@ -179,6 +181,13 @@ type mockEFSNamespaceClient struct {
 	mutex     sync.RWMutex
 	resources map[string]*efsv1alpha1.EFSNamespace
 	calls     []string // Track method calls for verification
+
+	// Override functions for testing error conditions
+	createFunc func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.CreateOptions) (*efsv1alpha1.EFSNamespace, error)
+	getFunc    func(ctx context.Context, name string, opts metav1.GetOptions) (*efsv1alpha1.EFSNamespace, error)
+	updateFunc func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.UpdateOptions) (*efsv1alpha1.EFSNamespace, error)
+	deleteFunc func(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	listFunc   func(ctx context.Context, opts metav1.ListOptions) (*efsv1alpha1.EFSNamespaceList, error)
 }
 
 func newMockEFSNamespaceClient() *mockEFSNamespaceClient {
@@ -193,6 +202,11 @@ func (m *mockEFSNamespaceClient) Create(ctx context.Context, efsNamespace *efsv1
 	defer m.mutex.Unlock()
 
 	m.calls = append(m.calls, "Create")
+
+	// Use override function if provided
+	if m.createFunc != nil {
+		return m.createFunc(ctx, efsNamespace, opts)
+	}
 
 	if _, exists := m.resources[efsNamespace.Name]; exists {
 		return nil, errors.NewAlreadyExists(schema.GroupResource{Group: "efs.csi.aws.com", Resource: "efsnamespaces"}, efsNamespace.Name)
@@ -212,6 +226,11 @@ func (m *mockEFSNamespaceClient) Update(ctx context.Context, efsNamespace *efsv1
 	defer m.mutex.Unlock()
 
 	m.calls = append(m.calls, "Update")
+
+	// Use override function if provided
+	if m.updateFunc != nil {
+		return m.updateFunc(ctx, efsNamespace, opts)
+	}
 
 	existing, exists := m.resources[efsNamespace.Name]
 	if !exists {
@@ -252,6 +271,11 @@ func (m *mockEFSNamespaceClient) Delete(ctx context.Context, name string, opts m
 
 	m.calls = append(m.calls, "Delete")
 
+	// Use override function if provided
+	if m.deleteFunc != nil {
+		return m.deleteFunc(ctx, name, opts)
+	}
+
 	if _, exists := m.resources[name]; !exists {
 		return errors.NewNotFound(schema.GroupResource{Group: "efs.csi.aws.com", Resource: "efsnamespaces"}, name)
 	}
@@ -261,40 +285,60 @@ func (m *mockEFSNamespaceClient) Delete(ctx context.Context, name string, opts m
 }
 
 func (m *mockEFSNamespaceClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*efsv1alpha1.EFSNamespace, error) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
+	// Need full lock for appending to calls slice
+	m.mutex.Lock()
 	m.calls = append(m.calls, "Get")
+
+	// Use override function if provided
+	if m.getFunc != nil {
+		result, err := m.getFunc(ctx, name, opts)
+		m.mutex.Unlock()
+		return result, err
+	}
 
 	resource, exists := m.resources[name]
 	if !exists {
+		m.mutex.Unlock()
 		return nil, errors.NewNotFound(schema.GroupResource{Group: "efs.csi.aws.com", Resource: "efsnamespaces"}, name)
 	}
 
-	return resource.DeepCopy(), nil
+	result := resource.DeepCopy()
+	m.mutex.Unlock()
+	return result, nil
 }
 
 func (m *mockEFSNamespaceClient) List(ctx context.Context, opts metav1.ListOptions) (*efsv1alpha1.EFSNamespaceList, error) {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
+	// Need full lock for appending to calls slice
+	m.mutex.Lock()
 	m.calls = append(m.calls, "List")
+
+	// Use override function if provided
+	if m.listFunc != nil {
+		result, err := m.listFunc(ctx, opts)
+		m.mutex.Unlock()
+		return result, err
+	}
 
 	list := &efsv1alpha1.EFSNamespaceList{}
 	for _, resource := range m.resources {
 		list.Items = append(list.Items, *resource.DeepCopy())
 	}
 
+	m.mutex.Unlock()
 	return list, nil
 }
 
 func (m *mockEFSNamespaceClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	m.mutex.Lock()
 	m.calls = append(m.calls, "Watch")
+	m.mutex.Unlock()
 	return watch.NewFake(), nil
 }
 
 func (m *mockEFSNamespaceClient) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*efsv1alpha1.EFSNamespace, error) {
+	m.mutex.Lock()
 	m.calls = append(m.calls, "Patch")
+	m.mutex.Unlock()
 	return nil, fmt.Errorf("patch not implemented in mock")
 }
 
@@ -337,15 +381,17 @@ func createTestMapper(t *testing.T) (*NamespaceEFSMapper, *mockEFSNamespaceClien
 func TestNewNamespaceEFSMapper(t *testing.T) {
 	tests := []struct {
 		name          string
-		k8sClient     interface{}
-		config        interface{}
+		k8sClient     kubernetes.Interface
+		config        *rest.Config
+		cloudClient   cloud.Cloud
 		expectError   bool
 		expectedError string
 	}{
 		{
 			name:          "nil kubernetes client",
 			k8sClient:     nil,
-			config:        &mockRestConfig{},
+			config:        &rest.Config{},
+			cloudClient:   &mockCloud{},
 			expectError:   true,
 			expectedError: "kubernetes client cannot be nil",
 		},
@@ -353,29 +399,30 @@ func TestNewNamespaceEFSMapper(t *testing.T) {
 			name:          "nil rest config",
 			k8sClient:     fake.NewSimpleClientset(),
 			config:        nil,
+			cloudClient:   &mockCloud{},
 			expectError:   true,
 			expectedError: "rest config cannot be nil",
 		},
 		{
-			name:        "valid inputs",
-			k8sClient:   fake.NewSimpleClientset(),
-			config:      &mockRestConfig{},
-			expectError: false,
+			name:          "nil cloud client",
+			k8sClient:     fake.NewSimpleClientset(),
+			config:        &rest.Config{},
+			cloudClient:   nil,
+			expectError:   true,
+			expectedError: "cloud client cannot be nil",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// This test would require mocking the rest.Config and CRD client creation
-			// For now, we test the basic validation logic
-			if tt.k8sClient == nil {
-				_, err := NewNamespaceEFSMapper(nil, nil, nil)
-				if err == nil {
-					t.Error("Expected error but got nil")
-				}
+			_, err := NewNamespaceEFSMapper(tt.k8sClient, tt.config, tt.cloudClient)
+			if tt.expectError {
+				assertError(t, err, "Expected error but got nil")
 				if err != nil && !containsString(err.Error(), tt.expectedError) {
 					t.Errorf("Expected error to contain '%s', got '%s'", tt.expectedError, err.Error())
 				}
+			} else {
+				assertNoError(t, err, "Expected no error")
 			}
 		})
 	}
@@ -1273,6 +1320,584 @@ func TestSetSyncPeriod(t *testing.T) {
 	}
 }
 
+// Additional tests for comprehensive coverage
+
+func TestCreateOrUpdateMappingErrorCases(t *testing.T) {
+	mapper, mockClient := createTestMapper(t)
+	ctx := context.Background()
+
+	t.Run("Create returns error", func(t *testing.T) {
+		// Setup mock to simulate creation error
+		mockClient.resources = make(map[string]*efsv1alpha1.EFSNamespace)
+
+		// Set override function to return an error
+		mockClient.createFunc = func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.CreateOptions) (*efsv1alpha1.EFSNamespace, error) {
+			return nil, fmt.Errorf("simulated create error")
+		}
+		defer func() { mockClient.createFunc = nil }()
+
+		_, err := mapper.CreateOrUpdateMapping(ctx, "error-ns", "fs-error", "arn:error", "us-east-1")
+		assertError(t, err, "Should return error when create fails")
+	})
+
+	t.Run("Get returns non-NotFound error", func(t *testing.T) {
+		// Setup mock to simulate get error that's not NotFound
+		mockClient.getFunc = func(ctx context.Context, name string, opts metav1.GetOptions) (*efsv1alpha1.EFSNamespace, error) {
+			return nil, fmt.Errorf("simulated get error")
+		}
+		defer func() { mockClient.getFunc = nil }()
+
+		_, err := mapper.CreateOrUpdateMapping(ctx, "get-error-ns", "fs-get-error", "arn:get-error", "us-east-1")
+		assertError(t, err, "Should return error when get fails")
+		assertBool(t, containsString(err.Error(), "failed to check existing EFSNamespace"), "Error should mention check failure")
+	})
+
+	t.Run("Update returns error", func(t *testing.T) {
+		// Pre-create an existing mapping
+		existing := &efsv1alpha1.EFSNamespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "update-error-ns",
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: efsv1alpha1.EFSNamespaceSpec{
+				Namespace:    "update-error-ns",
+				FileSystemID: "fs-old",
+				Region:       "us-east-1",
+			},
+		}
+		mockClient.resources["update-error-ns"] = existing
+
+		// Set override function to return an error
+		mockClient.updateFunc = func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.UpdateOptions) (*efsv1alpha1.EFSNamespace, error) {
+			return nil, fmt.Errorf("simulated update error")
+		}
+		defer func() { mockClient.updateFunc = nil }()
+
+		_, err := mapper.CreateOrUpdateMapping(ctx, "update-error-ns", "fs-new", "arn:new", "us-west-2")
+		assertError(t, err, "Should return error when update fails")
+		assertBool(t, containsString(err.Error(), "failed to update EFSNamespace CRD"), "Error should mention update failure")
+	})
+}
+
+func TestGetMappingErrorCases(t *testing.T) {
+	mapper, mockClient := createTestMapper(t)
+	ctx := context.Background()
+
+	t.Run("CRD Get returns non-NotFound error", func(t *testing.T) {
+		// Setup mock to return error for Get
+		mockClient.getFunc = func(ctx context.Context, name string, opts metav1.GetOptions) (*efsv1alpha1.EFSNamespace, error) {
+			return nil, fmt.Errorf("simulated CRD get error")
+		}
+		defer func() { mockClient.getFunc = nil }()
+
+		_, err := mapper.GetMapping(ctx, "error-ns")
+		assertError(t, err, "Should return error when CRD get fails")
+		assertBool(t, containsString(err.Error(), "failed to get EFSNamespace CRD"), "Error should mention CRD get failure")
+	})
+}
+
+func TestDeleteMappingErrorCase(t *testing.T) {
+	mapper, mockClient := createTestMapper(t)
+	ctx := context.Background()
+
+	t.Run("Delete returns non-NotFound error", func(t *testing.T) {
+		// Setup mock to return error for Delete
+		mockClient.deleteFunc = func(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+			return fmt.Errorf("simulated delete error")
+		}
+		defer func() { mockClient.deleteFunc = nil }()
+
+		err := mapper.DeleteMapping(ctx, "delete-error-ns")
+		assertError(t, err, "Should return error when delete fails")
+		assertBool(t, containsString(err.Error(), "failed to delete EFSNamespace CRD"), "Error should mention delete failure")
+	})
+}
+
+func TestListMappingsErrorCase(t *testing.T) {
+	mapper, mockClient := createTestMapper(t)
+	ctx := context.Background()
+
+	t.Run("List returns error", func(t *testing.T) {
+		// Setup mock to return error for List
+		mockClient.listFunc = func(ctx context.Context, opts metav1.ListOptions) (*efsv1alpha1.EFSNamespaceList, error) {
+			return nil, fmt.Errorf("simulated list error")
+		}
+		defer func() { mockClient.listFunc = nil }()
+
+		_, err := mapper.ListMappings(ctx)
+		assertError(t, err, "Should return error when list fails")
+		assertBool(t, containsString(err.Error(), "failed to list EFSNamespace CRDs"), "Error should mention list failure")
+	})
+}
+
+func TestRecoverFromAWSTagsEdgeCases(t *testing.T) {
+	mapper, mockClient := createTestMapperWithCloud(t)
+	ctx := context.Background()
+	clusterID := "test-cluster"
+
+	t.Run("Skip filesystem without ARN tag", func(t *testing.T) {
+		// Setup mock cloud
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-no-arn"},
+			},
+			fileSystemTags: map[string]map[string]string{
+				"fs-no-arn": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "no-arn-ns",
+					// Missing filesystem-arn tag
+				},
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error")
+		assertEqual(t, 0, recoveredCount, "Should skip filesystem without ARN")
+	})
+
+	t.Run("Error getting filesystem tags", func(t *testing.T) {
+		// Setup mock cloud to return error for GetFileSystemTags
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-tag-error"},
+			},
+			getFileSystemTagsError: map[string]error{
+				"fs-tag-error": fmt.Errorf("simulated tag retrieval error"),
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error even if individual filesystem tag retrieval fails")
+		assertEqual(t, 0, recoveredCount, "Should not recover filesystem with tag error")
+	})
+
+	t.Run("Skip conflicting existing mapping", func(t *testing.T) {
+		// Pre-create an existing mapping with different filesystem
+		existing := &efsv1alpha1.EFSNamespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "conflict-ns",
+			},
+			Spec: efsv1alpha1.EFSNamespaceSpec{
+				Namespace:    "conflict-ns",
+				FileSystemID: "fs-existing",
+				Region:       "us-east-1",
+			},
+		}
+		mockClient.resources["conflict-ns"] = existing
+
+		// Setup mock cloud with different filesystem
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-different"},
+			},
+			fileSystemTags: map[string]map[string]string{
+				"fs-different": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "conflict-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-different",
+				},
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error")
+		assertEqual(t, 0, recoveredCount, "Should skip conflicting mapping")
+	})
+
+	t.Run("Error checking existing mapping", func(t *testing.T) {
+		// Setup mock to return error when checking existing mapping
+		callCount := 0
+		mockClient.getFunc = func(ctx context.Context, name string, opts metav1.GetOptions) (*efsv1alpha1.EFSNamespace, error) {
+			callCount++
+			if name == "error-check-ns" {
+				return nil, fmt.Errorf("simulated get error")
+			}
+			return nil, errors.NewNotFound(schema.GroupResource{Group: "efs.csi.aws.com", Resource: "efsnamespaces"}, name)
+		}
+		defer func() { mockClient.getFunc = nil }()
+
+		// Setup mock cloud
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-check-error"},
+			},
+			fileSystemTags: map[string]map[string]string{
+				"fs-check-error": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "error-check-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-check-error",
+				},
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error for individual mapping check failure")
+		assertEqual(t, 0, recoveredCount, "Should skip mapping with check error")
+	})
+
+	t.Run("Error creating mapping during recovery", func(t *testing.T) {
+		// Setup mock to fail on create
+		mockClient.createFunc = func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.CreateOptions) (*efsv1alpha1.EFSNamespace, error) {
+			if efsNamespace.Name == "create-fail-ns" {
+				return nil, fmt.Errorf("simulated create error")
+			}
+			// Call the default implementation for other cases
+			result := efsNamespace.DeepCopy()
+			result.CreationTimestamp = metav1.Now()
+			result.ResourceVersion = "1"
+			mockClient.resources[efsNamespace.Name] = result
+			return result, nil
+		}
+		defer func() { mockClient.createFunc = nil }()
+
+		// Setup mock cloud
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-create-fail"},
+			},
+			fileSystemTags: map[string]map[string]string{
+				"fs-create-fail": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "create-fail-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-create-fail",
+				},
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error for individual create failure")
+		assertEqual(t, 0, recoveredCount, "Should not count failed creation")
+	})
+}
+
+func TestSyncWithAWSTagsError(t *testing.T) {
+	mapper, _ := createTestMapperWithCloud(t)
+	ctx := context.Background()
+	clusterID := "test-cluster"
+
+	t.Run("RecoverFromAWSTags returns error", func(t *testing.T) {
+		// Setup mock cloud to return error
+		mockCloudClient := &mockCloud{
+			region:               "us-east-1",
+			accountID:           "123456789012",
+			findFileSystemsError: fmt.Errorf("simulated AWS error"),
+		}
+		mapper.cloudClient = mockCloudClient
+		mapper.lastSyncTime = time.Time{} // Ensure sync will run
+
+		err := mapper.SyncWithAWSTags(ctx, clusterID)
+		assertError(t, err, "Should return error when recovery fails")
+		assertBool(t, containsString(err.Error(), "failed to sync with AWS tags"), "Error should mention sync failure")
+	})
+}
+
+func TestExtensiveConcurrency(t *testing.T) {
+	mapper, mockClient := createTestMapper(t)
+	ctx := context.Background()
+
+	// Pre-populate with test data
+	for i := 0; i < 10; i++ {
+		ns := fmt.Sprintf("ns%d", i)
+		efsNamespace := &efsv1alpha1.EFSNamespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              ns,
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: efsv1alpha1.EFSNamespaceSpec{
+				Namespace:    ns,
+				FileSystemID: fmt.Sprintf("fs-%d", i),
+				Region:       "us-east-1",
+			},
+		}
+		mockClient.resources[ns] = efsNamespace
+	}
+
+	t.Run("Concurrent reads and writes", func(t *testing.T) {
+		var wg sync.WaitGroup
+		errors := make(chan error, 100)
+
+		// Concurrent creates/updates
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ns := fmt.Sprintf("concurrent-ns%d", i)
+				_, err := mapper.CreateOrUpdateMapping(ctx, ns, fmt.Sprintf("fs-concurrent%d", i), fmt.Sprintf("arn:concurrent%d", i), "us-east-1")
+				if err != nil {
+					errors <- err
+				}
+			}(i)
+		}
+
+		// Concurrent reads
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ns := fmt.Sprintf("ns%d", i)
+				_, err := mapper.GetMapping(ctx, ns)
+				if err != nil {
+					errors <- err
+				}
+			}(i)
+		}
+
+		// Concurrent deletes
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ns := fmt.Sprintf("ns%d", i)
+				err := mapper.DeleteMapping(ctx, ns)
+				if err != nil {
+					errors <- err
+				}
+			}(i)
+		}
+
+		// Concurrent cache operations
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				if i%2 == 0 {
+					mapper.InvalidateCache(fmt.Sprintf("ns%d", i))
+				} else {
+					mapper.ClearCache()
+				}
+			}(i)
+		}
+
+		// Concurrent list operations
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := mapper.ListMappings(ctx)
+				if err != nil {
+					errors <- err
+				}
+			}()
+		}
+
+		wg.Wait()
+		close(errors)
+
+		// Check for race conditions
+		for err := range errors {
+			t.Errorf("Concurrent operation failed: %v", err)
+		}
+	})
+
+	t.Run("Concurrent cache updates with informer events", func(t *testing.T) {
+		var wg sync.WaitGroup
+
+		// Simulate concurrent informer events
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ns := fmt.Sprintf("event-ns%d", i)
+				efsNamespace := &efsv1alpha1.EFSNamespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:              ns,
+						CreationTimestamp: metav1.Now(),
+					},
+					Spec: efsv1alpha1.EFSNamespaceSpec{
+						Namespace:    ns,
+						FileSystemID: fmt.Sprintf("fs-event%d", i),
+						Region:       "us-east-1",
+					},
+				}
+
+				switch i % 3 {
+				case 0:
+					mapper.onEFSNamespaceAdd(efsNamespace)
+				case 1:
+					mapper.onEFSNamespaceUpdate(efsNamespace)
+				case 2:
+					mapper.onEFSNamespaceDelete(efsNamespace)
+				}
+			}(i)
+		}
+
+		// Concurrent cache reads during updates
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				ns := fmt.Sprintf("event-ns%d", i)
+				_ = mapper.getCachedMapping(ns)
+			}(i)
+		}
+
+		wg.Wait()
+	})
+}
+
+func TestCacheConsistency(t *testing.T) {
+	mapper, _ := createTestMapper(t)
+
+	t.Run("Cache isolation - modifications don't affect stored data", func(t *testing.T) {
+		original := &NamespaceEFSMapping{
+			Namespace:    "test-ns",
+			FileSystemID: "fs-original",
+			Region:       "us-east-1",
+		}
+
+		// Store in cache
+		mapper.updateCache("test-ns", original)
+
+		// Get from cache and modify
+		retrieved := mapper.getCachedMapping("test-ns")
+		assertNotNil(t, retrieved, "Should retrieve from cache")
+		retrieved.FileSystemID = "fs-modified"
+
+		// Get again and verify original is unchanged
+		retrieved2 := mapper.getCachedMapping("test-ns")
+		assertNotNil(t, retrieved2, "Should retrieve from cache")
+		assertEqual(t, "fs-original", retrieved2.FileSystemID, "Cache should preserve original value")
+	})
+
+	t.Run("Cache consistency during concurrent operations", func(t *testing.T) {
+		var wg sync.WaitGroup
+		ns := "consistency-test-ns"
+
+		// Perform many concurrent updates
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				mapping := &NamespaceEFSMapping{
+					Namespace:    ns,
+					FileSystemID: fmt.Sprintf("fs-%d", i),
+					Region:       "us-east-1",
+				}
+				mapper.updateCache(ns, mapping)
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Verify cache has a valid entry (any of the updates)
+		cached := mapper.getCachedMapping(ns)
+		assertNotNil(t, cached, "Cache should have an entry")
+		assertBool(t, cached.Namespace == ns, "Namespace should match")
+		assertBool(t, containsString(cached.FileSystemID, "fs-"), "FileSystemID should be from one of the updates")
+	})
+
+	t.Run("Cache operations with nil handling", func(t *testing.T) {
+		// Test that nil mappings are not stored in cache
+		// The updateCache method should handle nil gracefully
+		// by not storing it, so getting it should return nil
+		cached := mapper.getCachedMapping("non-existent-test")
+		assertNil(t, cached, "Should return nil for non-existent mapping")
+	})
+}
+
+func TestRecoverFromAWSTagsCompleteScenarios(t *testing.T) {
+	mapper, mockClient := createTestMapperWithCloud(t)
+	ctx := context.Background()
+	clusterID := "test-cluster"
+
+	t.Run("Mixed recovery scenarios", func(t *testing.T) {
+		// Setup existing mappings
+		existingMappings := map[string]*efsv1alpha1.EFSNamespace{
+			"existing-match-ns": {
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-match-ns"},
+				Spec: efsv1alpha1.EFSNamespaceSpec{
+					Namespace:    "existing-match-ns",
+					FileSystemID: "fs-match",
+					Region:       "us-east-1",
+				},
+			},
+			"existing-mismatch-ns": {
+				ObjectMeta: metav1.ObjectMeta{Name: "existing-mismatch-ns"},
+				Spec: efsv1alpha1.EFSNamespaceSpec{
+					Namespace:    "existing-mismatch-ns",
+					FileSystemID: "fs-old",
+					Region:       "us-east-1",
+				},
+			},
+		}
+
+		for name, efsNS := range existingMappings {
+			mockClient.resources[name] = efsNS
+		}
+
+		// Setup mock cloud with various scenarios
+		mockCloudClient := &mockCloud{
+			region:    "us-east-1",
+			accountID: "123456789012",
+			filesystems: []*cloud.FileSystem{
+				{FileSystemId: "fs-match"},          // Matches existing
+				{FileSystemId: "fs-new"},            // New mapping to recover
+				{FileSystemId: "fs-no-tags"},        // Missing required tags
+				{FileSystemId: "fs-no-namespace"},   // Missing namespace tag
+				{FileSystemId: "fs-mismatch"},       // Different from existing
+			},
+			fileSystemTags: map[string]map[string]string{
+				"fs-match": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "existing-match-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-match",
+				},
+				"fs-new": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "new-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-new",
+				},
+				"fs-no-tags": {
+					// Missing required tags
+				},
+				"fs-no-namespace": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					// Missing namespace tag
+				},
+				"fs-mismatch": {
+					"kubernetes.io/cluster/test-cluster": "owned",
+					"kubernetes.io/provisioning-mode":   "efs-ns",
+					"kubernetes.io/namespace":           "existing-mismatch-ns",
+					"kubernetes.io/filesystem-arn":      "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-mismatch",
+				},
+			},
+		}
+		mapper.cloudClient = mockCloudClient
+
+		recoveredCount, err := mapper.RecoverFromAWSTags(ctx, clusterID)
+		assertNoError(t, err, "Should not return error")
+		assertEqual(t, 1, recoveredCount, "Should recover only the new mapping")
+
+		// Verify the new mapping was created
+		newMapping, err := mapper.GetMapping(ctx, "new-ns")
+		assertNoError(t, err, "Should get new mapping")
+		assertNotNil(t, newMapping, "New mapping should exist")
+		assertEqual(t, "fs-new", newMapping.FileSystemID, "New mapping should have correct filesystem")
+	})
+}
+
 // Helper functions for tag-based recovery tests
 
 func createTestMapperWithCloud(t *testing.T) (*NamespaceEFSMapper, *mockEFSNamespaceClient) {
@@ -1296,4 +1921,107 @@ func createTestMapperWithCloud(t *testing.T) (*NamespaceEFSMapper, *mockEFSNames
 	}
 
 	return mapper, mockClient
+}
+
+func TestLifecycleOperations(t *testing.T) {
+	t.Run("Initialize and cache behavior", func(t *testing.T) {
+		mapper, mockClient := createTestMapper(t)
+		ctx := context.Background()
+
+		// Test initial state
+		assertBool(t, !mapper.initialized, "Mapper should not be initialized initially")
+
+		// Create some test data for cache loading
+		efsNamespace := &efsv1alpha1.EFSNamespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "test-ns",
+				CreationTimestamp: metav1.Now(),
+			},
+			Spec: efsv1alpha1.EFSNamespaceSpec{
+				Namespace:     "test-ns",
+				FileSystemID:  "fs-test123",
+				FileSystemArn: "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-test123",
+				Region:        "us-east-1",
+			},
+		}
+		mockClient.resources["test-ns"] = efsNamespace
+
+		// Test loading cache behavior
+		mappings, err := mapper.ListMappings(ctx)
+		assertNoError(t, err, "ListMappings should not return error")
+
+		for _, mapping := range mappings {
+			mappingCopy := mapping
+			mapper.updateCache(mapping.Namespace, &mappingCopy)
+		}
+
+		// Verify cache was loaded
+		cached := mapper.getCachedMapping("test-ns")
+		assertNotNil(t, cached, "Cache should be loaded")
+		assertEqual(t, "fs-test123", cached.FileSystemID, "FileSystemID should match")
+
+		// Test Stop behavior with initialized flag
+		mapper.initialized = true
+		mapper.Stop()
+		assertBool(t, !mapper.initialized, "Mapper should not be initialized after Stop")
+	})
+
+	t.Run("Multiple Stop calls", func(t *testing.T) {
+		mapper, _ := createTestMapper(t)
+
+		// Multiple stops should be safe
+		mapper.Stop()
+		mapper.Stop()
+		assertBool(t, !mapper.initialized, "Stop should handle multiple calls gracefully")
+	})
+
+	t.Run("Load cache from CRD", func(t *testing.T) {
+		mapper, mockClient := createTestMapper(t)
+		ctx := context.Background()
+
+		// Setup test data
+		efsNamespaces := []*efsv1alpha1.EFSNamespace{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "ns1",
+					CreationTimestamp: metav1.Now(),
+				},
+				Spec: efsv1alpha1.EFSNamespaceSpec{
+					Namespace:     "ns1",
+					FileSystemID:  "fs-111111",
+					FileSystemArn: "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-111111",
+					Region:        "us-east-1",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "ns2",
+					CreationTimestamp: metav1.Now(),
+				},
+				Spec: efsv1alpha1.EFSNamespaceSpec{
+					Namespace:     "ns2",
+					FileSystemID:  "fs-222222",
+					FileSystemArn: "arn:aws:elasticfilesystem:us-west-2:123456789012:file-system/fs-222222",
+					Region:        "us-west-2",
+				},
+			},
+		}
+
+		for _, efsNamespace := range efsNamespaces {
+			mockClient.resources[efsNamespace.Name] = efsNamespace
+		}
+
+		// Load cache through ListMappings (which is what loadCacheFromCRD does)
+		mappings, err := mapper.ListMappings(ctx)
+		assertNoError(t, err, "ListMappings should not return error")
+		assertEqual(t, 2, len(mappings), "Should have 2 mappings")
+
+		// Verify cache contains expected data
+		cached1 := mapper.getCachedMapping("ns1")
+		cached2 := mapper.getCachedMapping("ns2")
+		assertNotNil(t, cached1, "ns1 should be cached")
+		assertNotNil(t, cached2, "ns2 should be cached")
+		assertEqual(t, "fs-111111", cached1.FileSystemID, "ns1 FileSystemID mismatch")
+		assertEqual(t, "fs-222222", cached2.FileSystemID, "ns2 FileSystemID mismatch")
+	})
 }

@@ -323,7 +323,7 @@ func (w *execWatchdog) runLoop(stopCh <-chan struct{}) {
 		select {
 		case <-stopCh:
 			klog.Info("stopping...")
-			break
+			return
 		default:
 			err := w.exec()
 			if err != nil {

@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package versioned
+package fake
 
 import (
 	"context"
 	"testing"
 
 	efsv1alpha1 "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/apis/efs/v1alpha1"
-	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/generated/clientset/versioned/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -30,7 +29,7 @@ import (
 
 func TestClientset_Create(t *testing.T) {
 	ctx := context.Background()
-	clientset := fake.NewSimpleClientset()
+	clientset := NewSimpleClientset()
 
 	// Create a test EFSNamespace
 	efsNamespace := &efsv1alpha1.EFSNamespace{
@@ -73,7 +72,7 @@ func TestClientset_Get(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespace)
+	clientset := NewSimpleClientset(efsNamespace)
 
 	// Get the EFSNamespace
 	retrieved, err := clientset.EfsV1alpha1().EFSNamespaces().Get(ctx, "test-get", metav1.GetOptions{})
@@ -105,7 +104,7 @@ func TestClientset_Update(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespace)
+	clientset := NewSimpleClientset(efsNamespace)
 
 	// Update the EFSNamespace
 	efsNamespace.Spec.Region = "eu-west-1"
@@ -139,7 +138,7 @@ func TestClientset_UpdateStatus(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespace)
+	clientset := NewSimpleClientset(efsNamespace)
 
 	// Update the status
 	efsNamespace.Status = efsv1alpha1.EFSNamespaceStatus{
@@ -177,7 +176,7 @@ func TestClientset_Delete(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespace)
+	clientset := NewSimpleClientset(efsNamespace)
 
 	// Delete the EFSNamespace
 	err := clientset.EfsV1alpha1().EFSNamespaces().Delete(ctx, "test-delete", metav1.DeleteOptions{})
@@ -235,7 +234,7 @@ func TestClientset_List(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespaces...)
+	clientset := NewSimpleClientset(efsNamespaces...)
 
 	// List all EFSNamespaces
 	list, err := clientset.EfsV1alpha1().EFSNamespaces().List(ctx, metav1.ListOptions{})
@@ -262,7 +261,7 @@ func TestClientset_List(t *testing.T) {
 
 func TestClientset_Watch(t *testing.T) {
 	ctx := context.Background()
-	clientset := fake.NewSimpleClientset()
+	clientset := NewSimpleClientset()
 
 	// Set up watch
 	watcher, err := clientset.EfsV1alpha1().EFSNamespaces().Watch(ctx, metav1.ListOptions{})
@@ -331,7 +330,7 @@ func TestClientset_Patch(t *testing.T) {
 		},
 	}
 
-	clientset := fake.NewSimpleClientset(efsNamespace)
+	clientset := NewSimpleClientset(efsNamespace)
 
 	// Apply a patch - Note: fake client doesn't actually process patches properly,
 	// but we can test that the method exists and is callable
@@ -351,7 +350,7 @@ func TestClientset_Patch(t *testing.T) {
 
 func TestClientset_Reactor(t *testing.T) {
 	// Test that we can add custom reactors to the fake client
-	clientset := fake.NewSimpleClientset()
+	clientset := NewSimpleClientset()
 
 	createCalled := false
 	clientset.PrependReactor("create", "efsnamespaces", func(action ktesting.Action) (bool, runtime.Object, error) {
