@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/driver/mocks"
 	"k8s.io/client-go/kubernetes"
@@ -2758,19 +2759,538 @@ func TestNamespaceProvisioner_MetricsIntegration(t *testing.T) {
 	}
 }
 
-// Note: CSI Volume interface tests
-// The CreateNamespaceVolume and DeleteNamespaceVolume methods are defined in the interface
-// but are not yet implemented in the current codebase. When implemented, comprehensive tests
-// should be added here to verify:
-// 1. CSI request validation
-// 2. Volume ID parsing and generation
-// 3. Integration with EFS and Access Point creation
-// 4. Error handling and CSI response formatting
-// 5. Idempotent behavior for create and delete operations
+// CSI Volume interface tests
+func TestNamespaceProvisioner_CreateNamespaceVolume_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	options.ClusterID = "test-cluster"
 
-func TestNamespaceProvisioner_CSIVolumeInterface_PlaceholderTests(t *testing.T) {
-	// TODO: Add tests for CreateNamespaceVolume when implemented
-	// TODO: Add tests for DeleteNamespaceVolume when implemented
-	t.Skip("CSI Volume interface methods not yet implemented - tests will be added when methods are implemented")
+	lockMgr := NewLockManagerMap()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		lockManager:      &lockMgr,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+	}
+
+	// Mock successful filesystem lookup (already exists)
+	mockFileSystem := &cloud.FileSystem{
+		FileSystemId: "fs-12345",
+		Tags: map[string]string{
+			"kubernetes.io/namespace": "test-namespace",
+		},
+	}
+
+	mockAccessPoint := &cloud.AccessPoint{
+		AccessPointId: "fsap-67890",
+		FileSystemId:  "fs-12345",
+		CapacityGiB:   0,
+	}
+
+	// Setup mock expectations
+	mockMapper.getMappingFunc = func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    namespace,
+			FileSystemID: mockFileSystem.FileSystemId,
+		}, nil
+	}
+
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{mockFileSystem}, nil
+	}
+
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		return mockAccessPoint, nil
+	}
+
+	// Create test request
+	req := &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 1073741824, // 1GB
+		},
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+			"csi.storage.k8s.io/pvc/name":      "test-pvc",
+			"provisioningMode":                 "efs-ns",
+			"directoryPerms":                   "755",
+		},
+	}
+
+	// Call the method
+	ctx := context.Background()
+	response, err := provisioner.CreateNamespaceVolume(ctx, req)
+
+	// Verify results
+	if err != nil {
+		t.Fatalf("CreateNamespaceVolume failed: %v", err)
+	}
+
+	if response == nil {
+		t.Fatal("Expected non-nil response")
+	}
+
+	if response.Volume == nil {
+		t.Fatal("Expected non-nil volume in response")
+	}
+
+	if response.Volume.VolumeId != mockAccessPoint.AccessPointId {
+		t.Errorf("Expected volume ID %s, got %s", mockAccessPoint.AccessPointId, response.Volume.VolumeId)
+	}
+
+	if response.Volume.CapacityBytes != 1073741824 {
+		t.Errorf("Expected capacity %d, got %d", 1073741824, response.Volume.CapacityBytes)
+	}
+
+	// Verify volume context
+	volumeContext := response.Volume.VolumeContext
+	if volumeContext["accesspoint"] != mockAccessPoint.AccessPointId {
+		t.Errorf("Expected accesspoint %s in volume context, got %s", mockAccessPoint.AccessPointId, volumeContext["accesspoint"])
+	}
+
+	if volumeContext["filesystem"] != mockFileSystem.FileSystemId {
+		t.Errorf("Expected filesystem %s in volume context, got %s", mockFileSystem.FileSystemId, volumeContext["filesystem"])
+	}
+
+	if volumeContext["namespace"] != "test-namespace" {
+		t.Errorf("Expected namespace test-namespace in volume context, got %s", volumeContext["namespace"])
+	}
+
+	if volumeContext["pvcName"] != "test-pvc" {
+		t.Errorf("Expected pvcName test-pvc in volume context, got %s", volumeContext["pvcName"])
+	}
+}
+
+func TestNamespaceProvisioner_CreateNamespaceVolume_ValidationErrors(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	lockMgr := NewLockManagerMap()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		lockManager:      &lockMgr,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+	}
+
+	ctx := context.Background()
+
+	// Test nil request
+	_, err := provisioner.CreateNamespaceVolume(ctx, nil)
+	if err == nil || !contains(err.Error(), "cannot be nil") {
+		t.Errorf("Expected nil request error, got: %v", err)
+	}
+
+	// Test empty volume name
+	req := &csi.CreateVolumeRequest{
+		Name: "",
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+		},
+	}
+	_, err = provisioner.CreateNamespaceVolume(ctx, req)
+	if err == nil || !contains(err.Error(), "volume name cannot be empty") {
+		t.Errorf("Expected empty volume name error, got: %v", err)
+	}
+
+	// Test nil parameters
+	req = &csi.CreateVolumeRequest{
+		Name:       "test-volume",
+		Parameters: nil,
+	}
+	_, err = provisioner.CreateNamespaceVolume(ctx, req)
+	if err == nil || !contains(err.Error(), "volume parameters cannot be nil") {
+		t.Errorf("Expected nil parameters error, got: %v", err)
+	}
+
+	// Test missing namespace
+	req = &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		Parameters: map[string]string{
+			"provisioningMode": "efs-ns",
+		},
+	}
+	_, err = provisioner.CreateNamespaceVolume(ctx, req)
+	if err == nil || !contains(err.Error(), "namespace not found") {
+		t.Errorf("Expected missing namespace error, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_CreateNamespaceVolume_EFSCreationError(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	options.ClusterID = "test-cluster"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+		lockManager:      func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+	}
+
+	// Mock mapping not found and EFS creation error
+	mockMapper.getMappingFunc = func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+		return nil, fmt.Errorf("not found")
+	}
+
+	mockCloud.createFileSystemFunc = func(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
+		return nil, fmt.Errorf("EFS creation failed")
+	}
+
+	req := &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+			"csi.storage.k8s.io/pvc/name":      "test-pvc",
+			"provisioningMode":                 "efs-ns",
+		},
+	}
+
+	ctx := context.Background()
+	_, err := provisioner.CreateNamespaceVolume(ctx, req)
+
+	if err == nil || !contains(err.Error(), "failed to ensure namespace EFS") {
+		t.Errorf("Expected EFS creation error, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_CreateNamespaceVolume_AccessPointCreationError(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	options.ClusterID = "test-cluster"
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+		lockManager:      func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+	}
+
+	// Mock successful EFS retrieval but failed access point creation
+	mockFileSystem := &cloud.FileSystem{
+		FileSystemId: "fs-12345",
+	}
+
+	mockMapper.getMappingFunc = func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    namespace,
+			FileSystemID: mockFileSystem.FileSystemId,
+		}, nil
+	}
+
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{mockFileSystem}, nil
+	}
+
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		return nil, fmt.Errorf("access point creation failed")
+	}
+
+	req := &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+			"csi.storage.k8s.io/pvc/name":      "test-pvc",
+			"provisioningMode":                 "efs-ns",
+		},
+	}
+
+	ctx := context.Background()
+	_, err := provisioner.CreateNamespaceVolume(ctx, req)
+
+	if err == nil || !contains(err.Error(), "failed to create Access Point") {
+		t.Errorf("Expected access point creation error, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_CreateNamespaceVolume_ParameterParsing(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	options.ClusterID = "test-cluster"
+
+	lockMgr := NewLockManagerMap()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		lockManager:      &lockMgr,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+	}
+
+	// Mock responses
+	mockFileSystem := &cloud.FileSystem{
+		FileSystemId: "fs-12345",
+	}
+
+	mockAccessPoint := &cloud.AccessPoint{
+		AccessPointId: "fsap-67890",
+		FileSystemId:  "fs-12345",
+		CapacityGiB:   0,
+	}
+
+	mockMapper.getMappingFunc = func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    namespace,
+			FileSystemID: mockFileSystem.FileSystemId,
+		}, nil
+	}
+
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{mockFileSystem}, nil
+	}
+
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		return mockAccessPoint, nil
+	}
+
+	// Test with custom parameters
+	req := &csi.CreateVolumeRequest{
+		Name: "test-volume",
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: 2147483648, // 2GB
+		},
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+			"csi.storage.k8s.io/pvc/name":      "test-pvc",
+			"provisioningMode":                 "efs-ns",
+			"performanceMode":                  "maxIO",
+			"throughputMode":                   "provisioned",
+			"provisionedThroughputInMibps":     "100",
+			"encrypted":                        "true",
+			"kmsKeyId":                         "arn:aws:kms:us-west-2:123456789012:key/12345678-1234-1234-1234-123456789012",
+			"lifecyclePolicy":                  "AFTER_30_DAYS",
+			"backupPolicy":                     "ENABLED",
+			"basePath":                         "/custom/base/path",
+			"directoryPerms":                   "755",
+			"uid":                              "1000",
+			"gid":                              "1000",
+			"ensureUniqueDirectory":            "true",
+		},
+	}
+
+	ctx := context.Background()
+	response, err := provisioner.CreateNamespaceVolume(ctx, req)
+
+	if err != nil {
+		t.Fatalf("CreateNamespaceVolume failed: %v", err)
+	}
+
+	if response == nil || response.Volume == nil {
+		t.Fatal("Expected valid response with volume")
+	}
+
+	// Verify that sensitive parameters are not in volume context
+	volumeContext := response.Volume.VolumeContext
+	if _, exists := volumeContext["kmsKeyId"]; exists {
+		t.Error("Sensitive parameter kmsKeyId should not be in volume context")
+	}
+
+	// Verify capacity is set correctly
+	if response.Volume.CapacityBytes != 2147483648 {
+		t.Errorf("Expected capacity %d, got %d", 2147483648, response.Volume.CapacityBytes)
+	}
+}
+
+func TestNamespaceProvisioner_CreateNamespaceVolume_PVCNameFallback(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mockMapper := &testMockMapper{}
+	options := DefaultProvisionerOptions()
+	lockMgr := NewLockManagerMap()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:          options,
+		mapper:           mockMapper,
+		lockManager:      &lockMgr,
+		metricsCollector: &NoOpMetricsCollector{},
+		efsCache:         make(map[string]*CachedEFS),
+	}
+
+	// Mock responses
+	mockFileSystem := &cloud.FileSystem{
+		FileSystemId: "fs-12345",
+	}
+
+	mockAccessPoint := &cloud.AccessPoint{
+		AccessPointId: "fsap-67890",
+		FileSystemId:  "fs-12345",
+		CapacityGiB:   0,
+	}
+
+	mockMapper.getMappingFunc = func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    namespace,
+			FileSystemID: mockFileSystem.FileSystemId,
+		}, nil
+	}
+
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{mockFileSystem}, nil
+	}
+
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		return mockAccessPoint, nil
+	}
+
+	// Test without explicit PVC name - should use volume name as fallback
+	req := &csi.CreateVolumeRequest{
+		Name: "fallback-volume-name",
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+			"provisioningMode":                 "efs-ns",
+		},
+	}
+
+	ctx := context.Background()
+	response, err := provisioner.CreateNamespaceVolume(ctx, req)
+
+	if err != nil {
+		t.Fatalf("CreateNamespaceVolume failed: %v", err)
+	}
+
+	// Verify that volume name was used as PVC name
+	volumeContext := response.Volume.VolumeContext
+	if volumeContext["pvcName"] != "fallback-volume-name" {
+		t.Errorf("Expected pvcName fallback-volume-name, got %s", volumeContext["pvcName"])
+	}
+}
+
+func TestNamespaceProvisioner_ExtractNamespaceFromRequest(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	// Test with standard namespace parameter
+	req := &csi.CreateVolumeRequest{
+		Parameters: map[string]string{
+			"csi.storage.k8s.io/pvc/namespace": "test-namespace",
+		},
+	}
+
+	namespace, err := provisioner.extractNamespaceFromRequest(req)
+	if err != nil {
+		t.Fatalf("extractNamespaceFromRequest failed: %v", err)
+	}
+
+	if namespace != "test-namespace" {
+		t.Errorf("Expected namespace test-namespace, got %s", namespace)
+	}
+
+	// Test with alternative namespace parameter
+	req = &csi.CreateVolumeRequest{
+		Parameters: map[string]string{
+			"namespace": "alt-namespace",
+		},
+	}
+
+	namespace, err = provisioner.extractNamespaceFromRequest(req)
+	if err != nil {
+		t.Fatalf("extractNamespaceFromRequest failed: %v", err)
+	}
+
+	if namespace != "alt-namespace" {
+		t.Errorf("Expected namespace alt-namespace, got %s", namespace)
+	}
+
+	// Test with missing namespace
+	req = &csi.CreateVolumeRequest{
+		Parameters: map[string]string{
+			"other-param": "value",
+		},
+	}
+
+	_, err = provisioner.extractNamespaceFromRequest(req)
+	if err == nil {
+		t.Error("Expected error for missing namespace")
+	}
+}
+
+func TestNamespaceProvisioner_ParseEFSOptionsFromParams(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:   mockCloud,
+		options: options,
+	}
+
+	// Test with default values
+	params := map[string]string{}
+	efsOptions, err := provisioner.parseEFSOptionsFromParams(params)
+	if err != nil {
+		t.Fatalf("parseEFSOptionsFromParams failed: %v", err)
+	}
+
+	if efsOptions.PerformanceMode != "generalPurpose" {
+		t.Errorf("Expected default performance mode generalPurpose, got %s", efsOptions.PerformanceMode)
+	}
+
+	if efsOptions.ThroughputMode != "bursting" {
+		t.Errorf("Expected default throughput mode bursting, got %s", efsOptions.ThroughputMode)
+	}
+
+	if !efsOptions.Encrypted {
+		t.Error("Expected default encrypted to be true")
+	}
+
+	// Test with custom values
+	params = map[string]string{
+		"performanceMode":                  "maxIO",
+		"throughputMode":                   "provisioned",
+		"provisionedThroughputInMibps":     "100",
+		"encrypted":                        "false",
+		"kmsKeyId":                         "test-key-id",
+		"lifecyclePolicy":                  "AFTER_30_DAYS",
+		"backupPolicy":                     "DISABLED",
+	}
+
+	efsOptions, err = provisioner.parseEFSOptionsFromParams(params)
+	if err != nil {
+		t.Fatalf("parseEFSOptionsFromParams failed: %v", err)
+	}
+
+	if efsOptions.PerformanceMode != "maxIO" {
+		t.Errorf("Expected performance mode maxIO, got %s", efsOptions.PerformanceMode)
+	}
+
+	if efsOptions.ThroughputMode != "provisioned" {
+		t.Errorf("Expected throughput mode provisioned, got %s", efsOptions.ThroughputMode)
+	}
+
+	if efsOptions.ProvisionedThroughputInMibps != 100 {
+		t.Errorf("Expected provisioned throughput 100, got %d", efsOptions.ProvisionedThroughputInMibps)
+	}
+
+	if efsOptions.Encrypted {
+		t.Error("Expected encrypted to be false")
+	}
+
+	if efsOptions.KmsKeyId != "test-key-id" {
+		t.Errorf("Expected KMS key ID test-key-id, got %s", efsOptions.KmsKeyId)
+	}
+
+	if efsOptions.LifecyclePolicy != "AFTER_30_DAYS" {
+		t.Errorf("Expected lifecycle policy AFTER_30_DAYS, got %s", efsOptions.LifecyclePolicy)
+	}
+
+	if efsOptions.BackupPolicy != "DISABLED" {
+		t.Errorf("Expected backup policy DISABLED, got %s", efsOptions.BackupPolicy)
+	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1296,6 +1297,280 @@ func (np *NamespaceProvisioner) findExistingAccessPoint(ctx context.Context, pvc
 	}
 
 	return nil, cloud.ErrNotFound
+}
+
+// CreateNamespaceVolume implements the namespace-level EFS volume creation logic
+// This method is called from controller.go when provisioningMode is "efs-ns"
+func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	klog.V(4).Infof("CreateNamespaceVolume: called with request: %+v", req)
+
+	// Validate input parameters
+	if req == nil {
+		return nil, fmt.Errorf("CreateVolumeRequest cannot be nil")
+	}
+
+	volName := req.GetName()
+	if volName == "" {
+		return nil, fmt.Errorf("volume name cannot be empty")
+	}
+
+	volumeParams := req.GetParameters()
+	if volumeParams == nil {
+		return nil, fmt.Errorf("volume parameters cannot be nil")
+	}
+
+	// Extract namespace from PVC context
+	namespace, err := np.extractNamespaceFromRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract namespace: %w", err)
+	}
+
+	// Parse EFS options from volume parameters
+	efsOptions, err := np.parseEFSOptionsFromParams(volumeParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse EFS options: %w", err)
+	}
+
+	// Parse Access Point options from volume parameters
+	apOptions, err := np.parseAccessPointOptionsFromParams(volumeParams, namespace, volName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse Access Point options: %w", err)
+	}
+
+	// Ensure namespace EFS exists (create if necessary)
+	fileSystem, err := np.ensureNamespaceEFS(ctx, namespace, efsOptions)
+	if err != nil {
+		np.metricsCollector.RecordError("create_namespace_efs", namespace, err)
+		return nil, fmt.Errorf("failed to ensure namespace EFS: %w", err)
+	}
+
+	// Extract PVC name for Access Point creation
+	pvcName, err := np.extractPVCNameFromRequest(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract PVC name: %w", err)
+	}
+
+	// Update Access Point options with the correct filesystem ID
+	apOptions.FileSystemId = fileSystem.FileSystemId
+
+	// Create Access Point for this PVC
+	accessPoint, err := np.CreateAccessPointForPVC(ctx, pvcName, namespace, apOptions)
+	if err != nil {
+		np.metricsCollector.RecordError("create_access_point", namespace, err)
+		return nil, fmt.Errorf("failed to create Access Point for PVC %s: %w", pvcName, err)
+	}
+
+	// Get volume size from request
+	volSize := req.GetCapacityRange().GetRequiredBytes()
+
+	// Create the volume response
+	volumeId := accessPoint.AccessPointId
+	volumeContext := map[string]string{
+		"accesspoint": accessPoint.AccessPointId,
+		"filesystem":  fileSystem.FileSystemId,
+		"namespace":   namespace,
+		"pvcName":     pvcName,
+	}
+
+	// Add any additional context from the original request
+	if req.GetParameters() != nil {
+		for key, value := range req.GetParameters() {
+			// Only add non-sensitive parameters to volume context
+			if !np.isSensitiveParameter(key) {
+				volumeContext[key] = value
+			}
+		}
+	}
+
+	response := &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:      volumeId,
+			CapacityBytes: volSize,
+			VolumeContext: volumeContext,
+		},
+	}
+
+	klog.V(2).Infof("Successfully created namespace volume %s for PVC %s in namespace %s (EFS: %s, AP: %s)",
+		volName, pvcName, namespace, fileSystem.FileSystemId, accessPoint.AccessPointId)
+
+	return response, nil
+}
+
+// extractNamespaceFromRequest extracts the namespace from the CreateVolumeRequest
+func (np *NamespaceProvisioner) extractNamespaceFromRequest(req *csi.CreateVolumeRequest) (string, error) {
+	// First try to get namespace from volume parameters
+	if namespace, ok := req.GetParameters()["csi.storage.k8s.io/pvc/namespace"]; ok && namespace != "" {
+		return namespace, nil
+	}
+
+	// Try alternative parameter names
+	if namespace, ok := req.GetParameters()["namespace"]; ok && namespace != "" {
+		return namespace, nil
+	}
+
+	return "", fmt.Errorf("namespace not found in volume parameters")
+}
+
+// extractPVCNameFromRequest extracts the PVC name from the CreateVolumeRequest
+func (np *NamespaceProvisioner) extractPVCNameFromRequest(req *csi.CreateVolumeRequest) (string, error) {
+	// First try to get PVC name from volume parameters
+	if pvcName, ok := req.GetParameters()["csi.storage.k8s.io/pvc/name"]; ok && pvcName != "" {
+		return pvcName, nil
+	}
+
+	// Try alternative parameter names
+	if pvcName, ok := req.GetParameters()["pvcName"]; ok && pvcName != "" {
+		return pvcName, nil
+	}
+
+	// Fallback to volume name if no PVC name is found
+	volName := req.GetName()
+	if volName != "" {
+		klog.V(4).Infof("Using volume name %s as PVC name fallback", volName)
+		return volName, nil
+	}
+
+	return "", fmt.Errorf("PVC name not found in volume parameters")
+}
+
+// parseEFSOptionsFromParams parses EFS creation options from volume parameters
+func (np *NamespaceProvisioner) parseEFSOptionsFromParams(params map[string]string) (*EFSOptions, error) {
+	options := &EFSOptions{
+		PerformanceMode:  "generalPurpose", // Default
+		ThroughputMode:   "bursting",       // Default
+		Encrypted:        true,             // Default to encrypted
+		Tags:             make(map[string]string),
+	}
+
+	// Parse optional parameters
+	if performanceMode, ok := params["performanceMode"]; ok {
+		options.PerformanceMode = performanceMode
+	}
+
+	if throughputMode, ok := params["throughputMode"]; ok {
+		options.ThroughputMode = throughputMode
+	}
+
+	if provisionedThroughput, ok := params["provisionedThroughputInMibps"]; ok {
+		if throughput, err := strconv.ParseInt(provisionedThroughput, 10, 64); err == nil {
+			options.ProvisionedThroughputInMibps = throughput
+		}
+	}
+
+	if encrypted, ok := params["encrypted"]; ok {
+		if enc, err := strconv.ParseBool(encrypted); err == nil {
+			options.Encrypted = enc
+		}
+	}
+
+	if kmsKeyId, ok := params["kmsKeyId"]; ok {
+		options.KmsKeyId = kmsKeyId
+	}
+
+	if lifecyclePolicy, ok := params["lifecyclePolicy"]; ok {
+		options.LifecyclePolicy = lifecyclePolicy
+	}
+
+	if backupPolicy, ok := params["backupPolicy"]; ok {
+		options.BackupPolicy = backupPolicy
+	}
+
+	// Add default tags
+	if np.options != nil && np.options.DefaultTags != nil {
+		for k, v := range np.options.DefaultTags {
+			options.Tags[k] = v
+		}
+	}
+
+	return options, nil
+}
+
+// parseAccessPointOptionsFromParams parses Access Point creation options from volume parameters
+func (np *NamespaceProvisioner) parseAccessPointOptionsFromParams(params map[string]string, namespace, volName string) (*cloud.AccessPointOptions, error) {
+	options := &cloud.AccessPointOptions{
+		DirectoryPath:  DefaultBasePath,
+		DirectoryPerms: DefaultDirectoryPerms,
+		Uid:            DefaultUid,
+		Gid:            DefaultGid,
+		Tags:           make(map[string]string),
+	}
+
+	// Parse optional parameters
+	if basePath, ok := params["basePath"]; ok {
+		options.DirectoryPath = basePath
+	}
+
+	if directoryPerms, ok := params["directoryPerms"]; ok {
+		options.DirectoryPerms = directoryPerms
+	}
+
+	if uid, ok := params["uid"]; ok {
+		if uidVal, err := strconv.ParseInt(uid, 10, 64); err == nil {
+			options.Uid = uidVal
+		}
+	}
+
+	if gid, ok := params["gid"]; ok {
+		if gidVal, err := strconv.ParseInt(gid, 10, 64); err == nil {
+			options.Gid = gidVal
+		}
+	}
+
+	// Construct the full path: basePath/namespace/volName/uuid
+	if ensureUnique, ok := params["ensureUniqueDirectory"]; ok {
+		if unique, err := strconv.ParseBool(ensureUnique); err == nil && unique {
+			options.DirectoryPath = filepath.Join(options.DirectoryPath, namespace, volName, uuid.New().String())
+		} else {
+			options.DirectoryPath = filepath.Join(options.DirectoryPath, namespace, volName)
+		}
+	} else {
+		// Default to unique directories
+		options.DirectoryPath = filepath.Join(options.DirectoryPath, namespace, volName, uuid.New().String())
+	}
+
+	// Add tags for identification
+	options.Tags["kubernetes.io/namespace"] = namespace
+	options.Tags["kubernetes.io/pvc"] = volName
+	options.Tags["provisioning-mode"] = "efs-ns"
+
+	// Add cluster ID if available
+	if np.options != nil && np.options.ClusterID != "" {
+		options.Tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
+	}
+
+	return options, nil
+}
+
+// ensureNamespaceEFS ensures that an EFS filesystem exists for the given namespace
+func (np *NamespaceProvisioner) ensureNamespaceEFS(ctx context.Context, namespace string, options *EFSOptions) (*cloud.FileSystem, error) {
+	// First try to get existing EFS for the namespace
+	existing, err := np.GetNamespaceEFS(ctx, namespace)
+	if err == nil && existing != nil {
+		klog.V(4).Infof("Found existing EFS %s for namespace %s", existing.FileSystemId, namespace)
+		return existing, nil
+	}
+
+	// If not found, create a new EFS filesystem
+	klog.V(2).Infof("Creating new EFS filesystem for namespace %s", namespace)
+	return np.CreateNamespaceEFS(ctx, namespace, options)
+}
+
+// isSensitiveParameter checks if a parameter should be excluded from volume context
+func (np *NamespaceProvisioner) isSensitiveParameter(key string) bool {
+	sensitiveParams := []string{
+		"kmsKeyId",
+		"awsRoleArn",
+		"csi.storage.k8s.io/provisioner-secret-name",
+		"csi.storage.k8s.io/provisioner-secret-namespace",
+	}
+
+	for _, param := range sensitiveParams {
+		if key == param {
+			return true
+		}
+	}
+
+	return false
 }
 
 // NoOpMetricsCollector is a no-op implementation of MetricsCollector

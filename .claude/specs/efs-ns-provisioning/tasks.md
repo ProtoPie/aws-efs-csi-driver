@@ -130,7 +130,7 @@
   - _Requirements: 7.1_
 
 ### 4. Volume 생성/삭제 인터페이스 구현
-- [ ] 4.1 CreateNamespaceVolume 메서드 구현
+- [x] 4.1 CreateNamespaceVolume 메서드 구현
   - CreateVolumeRequest 파싱
   - 네임스페이스 추출 로직
   - EFS 생성 또는 재사용 판단 로직
