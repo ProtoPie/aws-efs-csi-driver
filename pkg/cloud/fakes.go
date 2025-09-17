@@ -148,3 +148,13 @@ func (c *FakeCloudProvider) CreateMountTarget(ctx context.Context, fileSystemId,
 		IPAddress:     "192.168.1.100",
 	}, nil
 }
+
+// DescribeFileSystems lists EFS filesystems with optional filtering by creation token and pagination support
+func (c *FakeCloudProvider) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*FileSystem, string, error) {
+	var result []*FileSystem
+	for _, fs := range c.fileSystems {
+		result = append(result, fs)
+	}
+	// Simple implementation - returns all filesystems without filtering or pagination
+	return result, "", nil
+}

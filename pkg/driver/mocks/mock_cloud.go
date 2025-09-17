@@ -56,6 +56,46 @@ func (mr *MockEfsMockRecorder) CreateAccessPoint(arg0, arg1 interface{}, arg2 ..
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateAccessPoint", reflect.TypeOf((*MockEfs)(nil).CreateAccessPoint), varargs...)
 }
 
+// CreateFileSystem mocks base method.
+func (m *MockEfs) CreateFileSystem(arg0 context.Context, arg1 *efs.CreateFileSystemInput, arg2 ...func(*efs.Options)) (*efs.CreateFileSystemOutput, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "CreateFileSystem", varargs...)
+	ret0, _ := ret[0].(*efs.CreateFileSystemOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateFileSystem indicates an expected call of CreateFileSystem.
+func (mr *MockEfsMockRecorder) CreateFileSystem(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateFileSystem", reflect.TypeOf((*MockEfs)(nil).CreateFileSystem), varargs...)
+}
+
+// CreateMountTarget mocks base method.
+func (m *MockEfs) CreateMountTarget(arg0 context.Context, arg1 *efs.CreateMountTargetInput, arg2 ...func(*efs.Options)) (*efs.CreateMountTargetOutput, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "CreateMountTarget", varargs...)
+	ret0, _ := ret[0].(*efs.CreateMountTargetOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateMountTarget indicates an expected call of CreateMountTarget.
+func (mr *MockEfsMockRecorder) CreateMountTarget(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateMountTarget", reflect.TypeOf((*MockEfs)(nil).CreateMountTarget), varargs...)
+}
+
 // DeleteAccessPoint mocks base method.
 func (m *MockEfs) DeleteAccessPoint(arg0 context.Context, arg1 *efs.DeleteAccessPointInput, arg2 ...func(*efs.Options)) (*efs.DeleteAccessPointOutput, error) {
 	m.ctrl.T.Helper()
@@ -136,46 +176,6 @@ func (mr *MockEfsMockRecorder) DescribeMountTargets(arg0, arg1 interface{}, arg2
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeMountTargets", reflect.TypeOf((*MockEfs)(nil).DescribeMountTargets), varargs...)
 }
 
-// CreateFileSystem mocks base method.
-func (m *MockEfs) CreateFileSystem(arg0 context.Context, arg1 *efs.CreateFileSystemInput, arg2 ...func(*efs.Options)) (*efs.CreateFileSystemOutput, error) {
-	m.ctrl.T.Helper()
-	varargs := []interface{}{arg0, arg1}
-	for _, a := range arg2 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "CreateFileSystem", varargs...)
-	ret0, _ := ret[0].(*efs.CreateFileSystemOutput)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// CreateFileSystem indicates an expected call of CreateFileSystem.
-func (mr *MockEfsMockRecorder) CreateFileSystem(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	varargs := append([]interface{}{arg0, arg1}, arg2...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateFileSystem", reflect.TypeOf((*MockEfs)(nil).CreateFileSystem), varargs...)
-}
-
-// CreateMountTarget mocks base method.
-func (m *MockEfs) CreateMountTarget(arg0 context.Context, arg1 *efs.CreateMountTargetInput, arg2 ...func(*efs.Options)) (*efs.CreateMountTargetOutput, error) {
-	m.ctrl.T.Helper()
-	varargs := []interface{}{arg0, arg1}
-	for _, a := range arg2 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "CreateMountTarget", varargs...)
-	ret0, _ := ret[0].(*efs.CreateMountTargetOutput)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// CreateMountTarget indicates an expected call of CreateMountTarget.
-func (mr *MockEfsMockRecorder) CreateMountTarget(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	varargs := append([]interface{}{arg0, arg1}, arg2...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateMountTarget", reflect.TypeOf((*MockEfs)(nil).CreateMountTarget), varargs...)
-}
-
 // MockCloud is a mock of Cloud interface.
 type MockCloud struct {
 	ctrl     *gomock.Controller
@@ -212,6 +212,36 @@ func (m *MockCloud) CreateAccessPoint(ctx context.Context, clientToken string, a
 func (mr *MockCloudMockRecorder) CreateAccessPoint(ctx, clientToken, accessPointOpts interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateAccessPoint", reflect.TypeOf((*MockCloud)(nil).CreateAccessPoint), ctx, clientToken, accessPointOpts)
+}
+
+// CreateFileSystem mocks base method.
+func (m *MockCloud) CreateFileSystem(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateFileSystem", ctx, clientToken, options)
+	ret0, _ := ret[0].(*cloud.FileSystem)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateFileSystem indicates an expected call of CreateFileSystem.
+func (mr *MockCloudMockRecorder) CreateFileSystem(ctx, clientToken, options interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateFileSystem", reflect.TypeOf((*MockCloud)(nil).CreateFileSystem), ctx, clientToken, options)
+}
+
+// CreateMountTarget mocks base method.
+func (m *MockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateMountTarget", ctx, fileSystemId, subnetId, securityGroupId)
+	ret0, _ := ret[0].(*cloud.MountTarget)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// CreateMountTarget indicates an expected call of CreateMountTarget.
+func (mr *MockCloudMockRecorder) CreateMountTarget(ctx, fileSystemId, subnetId, securityGroupId interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateMountTarget", reflect.TypeOf((*MockCloud)(nil).CreateMountTarget), ctx, fileSystemId, subnetId, securityGroupId)
 }
 
 // DeleteAccessPoint mocks base method.
@@ -256,6 +286,22 @@ func (m *MockCloud) DescribeFileSystem(ctx context.Context, fileSystemId string)
 func (mr *MockCloudMockRecorder) DescribeFileSystem(ctx, fileSystemId interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeFileSystem", reflect.TypeOf((*MockCloud)(nil).DescribeFileSystem), ctx, fileSystemId)
+}
+
+// DescribeFileSystems mocks base method.
+func (m *MockCloud) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*cloud.FileSystem, string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DescribeFileSystems", ctx, creationToken, maxResults)
+	ret0, _ := ret[0].([]*cloud.FileSystem)
+	ret1, _ := ret[1].(string)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// DescribeFileSystems indicates an expected call of DescribeFileSystems.
+func (mr *MockCloudMockRecorder) DescribeFileSystems(ctx, creationToken, maxResults interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DescribeFileSystems", reflect.TypeOf((*MockCloud)(nil).DescribeFileSystems), ctx, creationToken, maxResults)
 }
 
 // DescribeMountTargets mocks base method.
@@ -345,34 +391,4 @@ func (m *MockCloud) ListAccessPoints(ctx context.Context, fileSystemId string) (
 func (mr *MockCloudMockRecorder) ListAccessPoints(ctx, fileSystemId interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAccessPoints", reflect.TypeOf((*MockCloud)(nil).ListAccessPoints), ctx, fileSystemId)
-}
-
-// CreateFileSystem mocks base method.
-func (m *MockCloud) CreateFileSystem(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CreateFileSystem", ctx, clientToken, options)
-	ret0, _ := ret[0].(*cloud.FileSystem)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// CreateFileSystem indicates an expected call of CreateFileSystem.
-func (mr *MockCloudMockRecorder) CreateFileSystem(ctx, clientToken, options interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateFileSystem", reflect.TypeOf((*MockCloud)(nil).CreateFileSystem), ctx, clientToken, options)
-}
-
-// CreateMountTarget mocks base method.
-func (m *MockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CreateMountTarget", ctx, fileSystemId, subnetId, securityGroupId)
-	ret0, _ := ret[0].(*cloud.MountTarget)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// CreateMountTarget indicates an expected call of CreateMountTarget.
-func (mr *MockCloudMockRecorder) CreateMountTarget(ctx, fileSystemId, subnetId, securityGroupId interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateMountTarget", reflect.TypeOf((*MockCloud)(nil).CreateMountTarget), ctx, fileSystemId, subnetId, securityGroupId)
 }

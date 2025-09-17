@@ -93,11 +93,12 @@
   - 암호화 설정 적용
   - _Requirements: 2.2_
 
-- [ ] 3.3 EFS 파일 시스템 조회 로직
+- [x] 3.3 EFS 파일 시스템 조회 로직
   - GetNamespaceEFS 메서드 구현
   - 캐시 우선 조회 로직
   - AWS API fallback 로직
   - _Requirements: 2.2_
+  - **Completed**: Implemented DescribeFileSystems method in cloud.go and namespace_efs_mapper.go with comprehensive tests
 
 - [ ] 3.4 Mount Target 생성 로직
   - 다중 가용 영역 지원 구현

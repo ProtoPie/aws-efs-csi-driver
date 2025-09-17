@@ -130,6 +130,8 @@ type Cloud interface {
 	// EFS filesystem creation for namespace provisioning
 	CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (fs *FileSystem, err error)
 	CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (mt *MountTarget, err error)
+	// EFS filesystem query methods for namespace provisioning
+	DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) (fileSystems []*FileSystem, nextToken string, err error)
 	// Tag-based recovery methods for namespace provisioning
 	FindFileSystemsByTags(ctx context.Context, tags map[string]string) (fileSystems []*FileSystem, err error)
 	GetFileSystemTags(ctx context.Context, fileSystemId string) (tags map[string]string, err error)
@@ -507,6 +509,86 @@ func (c *cloud) DescribeFileSystem(ctx context.Context, fileSystemId string) (fs
 	return &FileSystem{
 		FileSystemId: *res.FileSystems[0].FileSystemId,
 	}, nil
+}
+
+// DescribeFileSystems lists EFS filesystems with optional filtering by creation token and pagination support
+// This method supports listing all filesystems or filtering by creation token for efficient namespace-based queries
+func (c *cloud) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*FileSystem, string, error) {
+	describeFsInput := &efs.DescribeFileSystemsInput{}
+
+	// Add optional filters
+	if creationToken != "" {
+		describeFsInput.CreationToken = &creationToken
+		klog.V(5).Infof("Filtering filesystems by creation token: %s", creationToken)
+	}
+
+	if maxResults > 0 {
+		// AWS EFS API has a maximum limit of 100
+		if maxResults > 100 {
+			maxResults = 100
+		}
+		describeFsInput.MaxItems = &maxResults
+	}
+
+	klog.V(5).Infof("Calling DescribeFileSystems with input: %+v", *describeFsInput)
+
+	res, err := c.efs.DescribeFileSystems(ctx, describeFsInput, func(o *efs.Options) {
+		o.Retryer = c.rm.describeFileSystemsRetryer
+	})
+	if err != nil {
+		if isAccessDenied(err) {
+			return nil, "", ErrAccessDenied
+		}
+		return nil, "", fmt.Errorf("failed to describe filesystems: %w", err)
+	}
+
+	// Convert AWS EFS types to our FileSystem type
+	var fileSystems []*FileSystem
+	for _, fs := range res.FileSystems {
+		fileSystem := &FileSystem{}
+
+		if fs.FileSystemId != nil {
+			fileSystem.FileSystemId = *fs.FileSystemId
+		}
+		if fs.LifeCycleState != "" {
+			fileSystem.LifeCycleState = string(fs.LifeCycleState)
+		}
+		if fs.CreationTime != nil {
+			fileSystem.CreationTime = fs.CreationTime
+		}
+		if fs.PerformanceMode != "" {
+			fileSystem.PerformanceMode = string(fs.PerformanceMode)
+		}
+		if fs.ThroughputMode != "" {
+			fileSystem.ThroughputMode = string(fs.ThroughputMode)
+		}
+		if fs.Encrypted != nil {
+			fileSystem.Encrypted = *fs.Encrypted
+		}
+		if fs.KmsKeyId != nil {
+			fileSystem.KmsKeyId = *fs.KmsKeyId
+		}
+
+		// Convert tags to map
+		tags := make(map[string]string)
+		for _, tag := range fs.Tags {
+			if tag.Key != nil && tag.Value != nil {
+				tags[*tag.Key] = *tag.Value
+			}
+		}
+		fileSystem.Tags = tags
+
+		fileSystems = append(fileSystems, fileSystem)
+	}
+
+	// Extract next token for pagination
+	var nextToken string
+	if res.NextMarker != nil {
+		nextToken = *res.NextMarker
+	}
+
+	klog.V(5).Infof("DescribeFileSystems returned %d filesystems", len(fileSystems))
+	return fileSystems, nextToken, nil
 }
 
 func (c *cloud) DescribeMountTargets(ctx context.Context, fileSystemId, azName string) (fs *MountTarget, err error) {

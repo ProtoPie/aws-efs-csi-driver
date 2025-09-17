@@ -470,6 +470,7 @@ func (m *testMockCloud) ListAccessPoints(ctx context.Context, fileSystemId strin
 func (m *testMockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) { return nil, nil }
 func (m *testMockCloud) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error) { return nil, nil }
 func (m *testMockCloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) { return nil, nil }
+func (m *testMockCloud) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*cloud.FileSystem, string, error) { return nil, "", nil }
 
 type mockMapper struct {
 	createOrUpdateMappingFunc func(ctx context.Context, namespace, fileSystemID, fileSystemArn, region string) (*NamespaceEFSMapping, error)
@@ -504,6 +505,7 @@ func (m *mockMapper) InvalidateCache(namespace string) {}
 func (m *mockMapper) ClearCache() {}
 func (m *mockMapper) RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error) { return 0, nil }
 func (m *mockMapper) SyncWithAWSTags(ctx context.Context, clusterID string) error { return nil }
+func (m *mockMapper) DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error) { return nil, nil }
 
 type mockLockManager struct {
 	acquireLockFunc func(ctx context.Context, key string, timeout time.Duration) (interface{}, error)

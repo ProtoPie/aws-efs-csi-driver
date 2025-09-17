@@ -62,6 +62,9 @@ type NamespaceEFSMapperInterface interface {
 	// Recovery operations
 	RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error)
 	SyncWithAWSTags(ctx context.Context, clusterID string) error
+
+	// EFS filesystem discovery
+	DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error)
 }
 
 // NamespaceEFSMapper manages the mapping between Kubernetes namespaces and EFS filesystems
@@ -587,4 +590,44 @@ func (m *NamespaceEFSMapper) SetSyncPeriod(period time.Duration) {
 
 	m.syncPeriod = period
 	klog.V(4).InfoS("Updated sync period", "syncPeriod", period)
+}
+
+// DescribeFileSystems lists all EFS filesystems and provides efficient caching and round-robin selection
+// This method supports dynamic filesystem discovery and selection for namespace provisioning
+func (m *NamespaceEFSMapper) DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error) {
+	klog.V(4).InfoS("Describing EFS filesystems for namespace provisioning")
+
+	// Use the cloud client to list all filesystems
+	// This provides more efficient querying than tag-based search
+	fileSystems, _, err := m.cloudClient.DescribeFileSystems(ctx, "", 100)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe filesystems: %w", err)
+	}
+
+	// Filter filesystems based on namespace provisioning tags if needed
+	var namespaceFSList []*cloud.FileSystem
+	for _, fs := range fileSystems {
+		// Check if this filesystem is managed for namespace provisioning
+		if fs.Tags != nil {
+			if mode, ok := fs.Tags["kubernetes.io/provisioning-mode"]; ok && mode == "efs-ns" {
+				namespaceFSList = append(namespaceFSList, fs)
+				klog.V(5).InfoS("Found namespace-provisioned filesystem",
+					"fileSystemId", fs.FileSystemId,
+					"namespace", fs.Tags["kubernetes.io/namespace"])
+			}
+		}
+	}
+
+	klog.V(4).InfoS("Described filesystems",
+		"totalCount", len(fileSystems),
+		"namespaceProvisionedCount", len(namespaceFSList))
+
+	// If no namespace-provisioned filesystems found, return all available filesystems
+	// This allows the provisioner to select from the general pool
+	if len(namespaceFSList) == 0 {
+		klog.V(4).InfoS("No namespace-provisioned filesystems found, returning all available filesystems")
+		return fileSystems, nil
+	}
+
+	return namespaceFSList, nil
 }
