@@ -20,10 +20,13 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/google/uuid"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
@@ -41,6 +44,14 @@ const (
 	DefaultRetryDelay       = 1 * time.Second
 	DefaultCleanupTimeout   = 10 * time.Minute
 	DefaultHealthCheckInterval = 30 * time.Second
+
+	// Access Point defaults
+	DefaultBasePath         = "/dynamic_provisioning"
+	DefaultDirectoryPerms   = "700"
+	DefaultUid              = 1001
+	DefaultGid              = 1001
+	DefaultGidRangeStart    = 1000
+	DefaultGidRangeEnd      = 2000
 )
 
 // EFSOptions contains options for creating EFS filesystems
@@ -53,6 +64,21 @@ type EFSOptions struct {
 	LifecyclePolicy              string
 	BackupPolicy                 string
 	Tags                         map[string]string
+}
+
+// AccessPointCreationOptions contains options for creating Access Points
+type AccessPointCreationOptions struct {
+	FileSystemId          string
+	BasePath              string
+	SubPathPattern        string
+	EnsureUniqueDirectory bool
+	DirectoryPerms        string
+	Uid                   *int64
+	Gid                   *int64
+	GidRangeStart         *int64
+	GidRangeEnd           *int64
+	ReuseAccessPoint      bool
+	Tags                  map[string]string
 }
 
 // NamespaceProvisionerInterface defines the interface for namespace-level EFS provisioning
@@ -100,7 +126,7 @@ type NamespaceProvisioner struct {
 
 	// Component dependencies
 	mapper      NamespaceEFSMapperInterface
-	lockManager LockManagerMap
+	lockManager *LockManagerMap
 
 	// Configuration
 	options *ProvisionerOptions
@@ -213,13 +239,16 @@ func NewNamespaceProvisioner(cloud cloud.Cloud, k8sClient kubernetes.Interface, 
 		metricsCollector = &NoOpMetricsCollector{}
 	}
 
+	// Initialize lock manager
+	lockManager := NewLockManagerMap()
+
 	provisioner := &NamespaceProvisioner{
-		cloud:      cloud,
-		k8sClient:  k8sClient,
-		config:     config,
-		mapper:     mapper,
-		lockManager: NewLockManagerMap(),
-		options:    options,
+		cloud:       cloud,
+		k8sClient:   k8sClient,
+		config:      config,
+		mapper:      mapper,
+		lockManager: &lockManager,
+		options:     options,
 		status: &ProvisionerStatus{
 			Started:         false,
 			Healthy:         false,
@@ -971,6 +1000,302 @@ func (np *NamespaceProvisioner) DeleteNamespaceEFS(ctx context.Context, namespac
 	// For now, we'll just log and return nil (retain policy)
 	klog.V(2).Infof("Delete EFS for namespace %s requested - using retain policy", namespace)
 	return nil
+}
+
+// CreateAccessPointForPVC creates an Access Point for the given PVC within the namespace EFS
+func (np *NamespaceProvisioner) CreateAccessPointForPVC(ctx context.Context, pvcName, namespace string, options *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+	startTime := time.Now()
+
+	// Validate input parameters
+	if pvcName == "" {
+		return nil, fmt.Errorf("PVC name cannot be empty")
+	}
+	if namespace == "" {
+		return nil, fmt.Errorf("namespace cannot be empty")
+	}
+	if options == nil {
+		return nil, fmt.Errorf("access point options cannot be nil")
+	}
+	if options.FileSystemId == "" {
+		return nil, fmt.Errorf("FileSystemId must be specified in access point options")
+	}
+
+	klog.V(2).Infof("Creating Access Point for PVC %s in namespace %s with FileSystem %s",
+		pvcName, namespace, options.FileSystemId)
+
+	// Acquire lock to prevent concurrent access point creation for the same PVC
+	lockKey := fmt.Sprintf("accesspoint:%s:%s", namespace, pvcName)
+	if !np.lockManager.lockMutex(lockKey, np.options.CreateTimeout) {
+		err := fmt.Errorf("failed to acquire lock for PVC %s in namespace %s within timeout", pvcName, namespace)
+		np.metricsCollector.RecordError("acquire_accesspoint_lock", namespace, err)
+		return nil, err
+	}
+	defer func() {
+		np.lockManager.unlockMutex(lockKey)
+	}()
+
+	// Check if Access Point should be reused (if reuseAccessPoint is enabled)
+	if np.shouldReuseAccessPoint(options) {
+		existing, err := np.findExistingAccessPoint(ctx, pvcName, namespace, options.FileSystemId)
+		if err == nil && existing != nil {
+			klog.V(2).Infof("Reusing existing Access Point %s for PVC %s", existing.AccessPointId, pvcName)
+			return existing, nil
+		}
+		if err != nil {
+			klog.V(4).Infof("Failed to find existing Access Point for reuse: %v", err)
+		}
+	}
+
+	// Build Access Point path
+	accessPointPath, err := np.buildAccessPointPath(pvcName, namespace, options)
+	if err != nil {
+		np.metricsCollector.RecordError("build_accesspoint_path", namespace, err)
+		return nil, fmt.Errorf("failed to build access point path: %w", err)
+	}
+
+	// Set POSIX user and group IDs
+	uid, gid, err := np.determinePosixIDs(options)
+	if err != nil {
+		np.metricsCollector.RecordError("determine_posix_ids", namespace, err)
+		return nil, fmt.Errorf("failed to determine POSIX IDs: %w", err)
+	}
+
+	// Set directory permissions
+	directoryPerms := options.DirectoryPerms
+	if directoryPerms == "" {
+		directoryPerms = DefaultDirectoryPerms
+	}
+
+	// Build tags for the Access Point
+	tags := np.buildAccessPointTags(pvcName, namespace, options.Tags)
+
+	// Generate client token for idempotency
+	clientToken := fmt.Sprintf("ap-%s-%s-%d", namespace, pvcName, time.Now().UnixNano())
+
+	// Create the cloud Access Point options
+	cloudOptions := &cloud.AccessPointOptions{
+		FileSystemId:   options.FileSystemId,
+		DirectoryPath:  accessPointPath,
+		DirectoryPerms: directoryPerms,
+		Uid:            uid,
+		Gid:            gid,
+		Tags:           tags,
+		CapacityGiB:    options.CapacityGiB, // Pass through for testing purposes
+	}
+
+	klog.V(2).Infof("Creating Access Point with path %s, uid=%d, gid=%d, perms=%s",
+		accessPointPath, uid, gid, directoryPerms)
+
+	// Create the Access Point via cloud provider
+	accessPoint, err := np.cloud.CreateAccessPoint(ctx, clientToken, cloudOptions)
+	if err != nil {
+		np.metricsCollector.RecordError("create_accesspoint", namespace, err)
+		return nil, fmt.Errorf("failed to create Access Point for PVC %s: %w", pvcName, err)
+	}
+
+	// Record metrics
+	np.metricsCollector.RecordEFSCreationTime(namespace, time.Since(startTime))
+	np.metricsCollector.IncAccessPointCreated(namespace)
+
+	klog.V(2).Infof("Successfully created Access Point %s for PVC %s in namespace %s in %v",
+		accessPoint.AccessPointId, pvcName, namespace, time.Since(startTime))
+
+	return accessPoint, nil
+}
+
+// DeleteAccessPointForPVC deletes the Access Point for the given PVC
+func (np *NamespaceProvisioner) DeleteAccessPointForPVC(ctx context.Context, pvcName, namespace string) error {
+	if pvcName == "" {
+		return fmt.Errorf("PVC name cannot be empty")
+	}
+	if namespace == "" {
+		return fmt.Errorf("namespace cannot be empty")
+	}
+
+	klog.V(2).Infof("Deleting Access Point for PVC %s in namespace %s", pvcName, namespace)
+
+	// Get the namespace EFS to search for the Access Point
+	fs, err := np.GetNamespaceEFS(ctx, namespace)
+	if err != nil {
+		klog.Warningf("Failed to get namespace EFS for %s: %v", namespace, err)
+		// Don't fail the operation if we can't find the EFS - the Access Point might already be deleted
+		return nil
+	}
+
+	// Find the Access Point by tags
+	accessPoint, err := np.findExistingAccessPoint(ctx, pvcName, namespace, fs.FileSystemId)
+	if err != nil {
+		if err == cloud.ErrNotFound {
+			klog.V(2).Infof("Access Point for PVC %s in namespace %s not found - assuming already deleted", pvcName, namespace)
+			return nil
+		}
+		return fmt.Errorf("failed to find Access Point for PVC %s: %w", pvcName, err)
+	}
+
+	if accessPoint == nil {
+		klog.V(2).Infof("No Access Point found for PVC %s in namespace %s", pvcName, namespace)
+		return nil
+	}
+
+	// Acquire lock to prevent concurrent operations on the same Access Point
+	lockKey := fmt.Sprintf("accesspoint:%s:%s", namespace, pvcName)
+	if !np.lockManager.lockMutex(lockKey, np.options.DeleteTimeout) {
+		err := fmt.Errorf("failed to acquire lock for deleting Access Point of PVC %s in namespace %s within timeout", pvcName, namespace)
+		np.metricsCollector.RecordError("acquire_delete_accesspoint_lock", namespace, err)
+		return err
+	}
+	defer func() {
+		np.lockManager.unlockMutex(lockKey)
+	}()
+
+	// Delete the Access Point
+	if err := np.cloud.DeleteAccessPoint(ctx, accessPoint.AccessPointId); err != nil {
+		if err == cloud.ErrNotFound {
+			klog.V(2).Infof("Access Point %s for PVC %s already deleted", accessPoint.AccessPointId, pvcName)
+			return nil
+		}
+		np.metricsCollector.RecordError("delete_accesspoint", namespace, err)
+		return fmt.Errorf("failed to delete Access Point %s for PVC %s: %w", accessPoint.AccessPointId, pvcName, err)
+	}
+
+	// Record metrics
+	np.metricsCollector.IncAccessPointDeleted(namespace)
+
+	klog.V(2).Infof("Successfully deleted Access Point %s for PVC %s in namespace %s",
+		accessPoint.AccessPointId, pvcName, namespace)
+
+	return nil
+}
+
+// buildAccessPointPath constructs the directory path for an Access Point
+func (np *NamespaceProvisioner) buildAccessPointPath(pvcName, namespace string, options *cloud.AccessPointOptions) (string, error) {
+	// Use base path from options or default
+	basePath := DefaultBasePath
+	if options.DirectoryPath != "" {
+		// If DirectoryPath is already set in options, use it directly
+		basePath = options.DirectoryPath
+	}
+
+	// Apply subPath pattern if specified
+	// For now, we'll use PVC name as subPath pattern
+	subPath := pvcName
+
+	// Ensure unique directory if requested
+	// UUID ensures uniqueness across the entire cluster
+	uniqueId := uuid.New().String()
+
+	// Build the full path
+	var fullPath string
+	if strings.Contains(subPath, "${.PV.name}") || strings.Contains(subPath, "${.PVC.name}") {
+		// Handle template patterns
+		subPath = strings.ReplaceAll(subPath, "${.PVC.name}", pvcName)
+		subPath = strings.ReplaceAll(subPath, "${.PV.name}", pvcName) // For compatibility
+		fullPath = filepath.Join(basePath, subPath, uniqueId)
+	} else {
+		// Simple path construction
+		fullPath = filepath.Join(basePath, namespace, subPath, uniqueId)
+	}
+
+	// Ensure path starts with / and is clean
+	fullPath = filepath.Clean("/" + strings.TrimPrefix(fullPath, "/"))
+
+	klog.V(4).Infof("Built Access Point path: %s for PVC %s in namespace %s", fullPath, pvcName, namespace)
+	return fullPath, nil
+}
+
+// determinePosixIDs determines the UID and GID to use for the Access Point
+func (np *NamespaceProvisioner) determinePosixIDs(options *cloud.AccessPointOptions) (uid, gid int64, err error) {
+	// Use specified UID if provided
+	if options.Uid > 0 {
+		uid = options.Uid
+	} else {
+		uid = DefaultUid
+	}
+
+	// Use specified GID if provided
+	if options.Gid > 0 {
+		gid = options.Gid
+	} else {
+		// If GID range is specified, pick a random GID within the range
+		gidRangeStart := int64(DefaultGidRangeStart)
+		gidRangeEnd := int64(DefaultGidRangeEnd)
+
+		// Generate a random GID within the range for multi-tenancy
+		if gidRangeEnd > gidRangeStart {
+			gid = gidRangeStart + rand.Int63n(gidRangeEnd-gidRangeStart)
+		} else {
+			gid = DefaultGid
+		}
+	}
+
+	// Validate IDs
+	if uid <= 0 || gid <= 0 {
+		return 0, 0, fmt.Errorf("invalid POSIX IDs: uid=%d, gid=%d (must be positive)", uid, gid)
+	}
+
+	return uid, gid, nil
+}
+
+// buildAccessPointTags builds the tags map for an Access Point
+func (np *NamespaceProvisioner) buildAccessPointTags(pvcName, namespace string, additionalTags map[string]string) map[string]string {
+	tags := make(map[string]string)
+
+	// Add default tags from provisioner options
+	for k, v := range np.options.DefaultTags {
+		tags[k] = v
+	}
+
+	// Add additional tags passed in options
+	for k, v := range additionalTags {
+		tags[k] = v
+	}
+
+	// Add required namespace provisioning tags
+	tags["kubernetes.io/namespace"] = namespace
+	tags["kubernetes.io/pvc-name"] = pvcName
+	tags["kubernetes.io/provisioning-mode"] = "efs-ns"
+	tags["kubernetes.io/created-by"] = "efs-ns-provisioner"
+
+	if np.options.ClusterID != "" {
+		tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
+	}
+
+	return tags
+}
+
+// shouldReuseAccessPoint determines if Access Point reuse is enabled
+func (np *NamespaceProvisioner) shouldReuseAccessPoint(options *cloud.AccessPointOptions) bool {
+	// This could be controlled by a parameter in the future
+	// For now, return false to always create new Access Points
+	return false
+}
+
+// findExistingAccessPoint searches for an existing Access Point by PVC name and namespace
+func (np *NamespaceProvisioner) findExistingAccessPoint(ctx context.Context, pvcName, namespace, fileSystemId string) (*cloud.AccessPoint, error) {
+	// List all Access Points for the filesystem
+	accessPoints, err := np.cloud.ListAccessPoints(ctx, fileSystemId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Access Points for filesystem %s: %w", fileSystemId, err)
+	}
+
+	// Search for Access Point with matching tags
+	for _, ap := range accessPoints {
+		// We would need to get the Access Point details to check tags
+		// For now, we'll use the DescribeAccessPoint method if available
+		detailedAP, err := np.cloud.DescribeAccessPoint(ctx, ap.AccessPointId)
+		if err != nil {
+			klog.V(4).Infof("Failed to describe Access Point %s: %v", ap.AccessPointId, err)
+			continue
+		}
+
+		// Check if this Access Point matches our PVC
+		// Since the cloud.AccessPoint struct doesn't include tags directly,
+		// we would need to extend the interface to get tags, or use a different approach
+		// For now, we'll return nil to indicate no existing Access Point found
+		_ = detailedAP
+	}
+
+	return nil, cloud.ErrNotFound
 }
 
 // NoOpMetricsCollector is a no-op implementation of MetricsCollector

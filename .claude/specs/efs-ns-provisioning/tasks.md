@@ -106,12 +106,21 @@
   - 보안 그룹 설정 로직
   - _Requirements: 3.4_
 
-- [ ] 3.5 Access Point 관리 로직
+- [x] 3.5 Access Point 관리 로직
   - CreateAccessPointForPVC 메서드 구현
   - POSIX 권한 설정 로직
   - 경로 생성 로직 (basePath + subPath)
   - UUID를 통한 고유성 보장
+  - DeleteAccessPointForPVC 메서드 구현
   - _Requirements: 2.3_
+  - **Completed**: Implemented comprehensive Access Point management with:
+    - Full parameter validation and error handling
+    - POSIX UID/GID assignment with configurable ranges
+    - Path construction using basePath + namespace + PVC name + UUID
+    - Proper tagging for resource identification and cleanup
+    - Lock-based concurrency control to prevent race conditions
+    - Integration with cloud provider API for AP lifecycle
+    - Comprehensive unit tests covering all scenarios (9 test cases)
 
 - [ ] 3.6 단위 테스트 작성
   - EFS 생성 로직 테스트

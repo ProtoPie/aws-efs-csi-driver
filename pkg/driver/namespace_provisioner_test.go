@@ -427,6 +427,59 @@ func BenchmarkNamespaceProvisioner_SetCachedEFS(b *testing.B) {
 
 // Mock implementations for testing
 
+type testMockMapper struct {
+	getMappingFunc func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error)
+}
+
+func (m *testMockMapper) CreateOrUpdateMapping(ctx context.Context, namespace, fileSystemID, fileSystemArn, region string) (*NamespaceEFSMapping, error) {
+	return &NamespaceEFSMapping{
+		Namespace:     namespace,
+		FileSystemID:  fileSystemID,
+		FileSystemArn: fileSystemArn,
+		Region:        region,
+	}, nil
+}
+
+func (m *testMockMapper) GetMapping(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+	if m.getMappingFunc != nil {
+		return m.getMappingFunc(ctx, namespace)
+	}
+	return nil, fmt.Errorf("mapping not found")
+}
+
+func (m *testMockMapper) DeleteMapping(ctx context.Context, namespace string) error {
+	return nil
+}
+
+func (m *testMockMapper) ListMappings(ctx context.Context) ([]NamespaceEFSMapping, error) {
+	return []NamespaceEFSMapping{}, nil
+}
+
+func (m *testMockMapper) Start(ctx context.Context) error {
+	return nil
+}
+
+func (m *testMockMapper) Stop() {
+}
+
+func (m *testMockMapper) InvalidateCache(namespace string) {
+}
+
+func (m *testMockMapper) ClearCache() {
+}
+
+func (m *testMockMapper) RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error) {
+	return 0, nil
+}
+
+func (m *testMockMapper) SyncWithAWSTags(ctx context.Context, clusterID string) error {
+	return nil
+}
+
+func (m *testMockMapper) DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error) {
+	return []*cloud.FileSystem{}, nil
+}
+
 type testMockCloud struct {
 	createFileSystemFunc        func(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error)
 	describeFileSystemFunc      func(ctx context.Context, fileSystemId string) (*cloud.FileSystem, error)
@@ -434,6 +487,11 @@ type testMockCloud struct {
 	describeMountTargetsFunc    func(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error)
 	createMountTargetFunc       func(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*cloud.MountTarget, error)
 	getMetadataFunc             func() cloud.MetadataService
+	// Access Point functions
+	createAccessPointFunc       func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error)
+	deleteAccessPointFunc       func(ctx context.Context, accessPointId string) error
+	describeAccessPointFunc     func(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error)
+	listAccessPointsFunc        func(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error)
 }
 
 func (m *testMockCloud) CreateFileSystem(ctx context.Context, clientToken string, options *cloud.FileSystemOptions) (*cloud.FileSystem, error) {
@@ -470,11 +528,45 @@ func (m *testMockCloud) GetMetadata() cloud.MetadataService {
 	}
 	return nil
 }
-func (m *testMockCloud) CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) { return nil, nil }
-func (m *testMockCloud) DeleteAccessPoint(ctx context.Context, accessPointId string) error { return nil }
-func (m *testMockCloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) { return nil, nil }
-func (m *testMockCloud) FindAccessPointByClientToken(ctx context.Context, clientToken, fileSystemId string) (*cloud.AccessPoint, error) { return nil, nil }
-func (m *testMockCloud) ListAccessPoints(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error) { return nil, nil }
+
+func (m *testMockCloud) CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+	if m.createAccessPointFunc != nil {
+		return m.createAccessPointFunc(ctx, clientToken, accessPointOpts)
+	}
+	return &cloud.AccessPoint{
+		AccessPointId: "fsap-12345678",
+		FileSystemId:  accessPointOpts.FileSystemId,
+		CapacityGiB:   accessPointOpts.CapacityGiB,
+	}, nil
+}
+
+func (m *testMockCloud) DeleteAccessPoint(ctx context.Context, accessPointId string) error {
+	if m.deleteAccessPointFunc != nil {
+		return m.deleteAccessPointFunc(ctx, accessPointId)
+	}
+	return nil
+}
+
+func (m *testMockCloud) DescribeAccessPoint(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+	if m.describeAccessPointFunc != nil {
+		return m.describeAccessPointFunc(ctx, accessPointId)
+	}
+	return &cloud.AccessPoint{
+		AccessPointId: accessPointId,
+		FileSystemId:  "fs-12345678",
+	}, nil
+}
+
+func (m *testMockCloud) FindAccessPointByClientToken(ctx context.Context, clientToken, fileSystemId string) (*cloud.AccessPoint, error) {
+	return nil, cloud.ErrNotFound
+}
+
+func (m *testMockCloud) ListAccessPoints(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error) {
+	if m.listAccessPointsFunc != nil {
+		return m.listAccessPointsFunc(ctx, fileSystemId)
+	}
+	return []*cloud.AccessPoint{}, nil
+}
 func (m *testMockCloud) DescribeMountTargets(ctx context.Context, fileSystemId, az string) (*cloud.MountTarget, error) {
 	if m.describeMountTargetsFunc != nil {
 		return m.describeMountTargetsFunc(ctx, fileSystemId, az)
@@ -579,7 +671,7 @@ func (m *mockMetricsCollector) SetActiveNamespaces(count int) {}
 func TestNamespaceProvisioner_CreateNamespaceEFS_Success(t *testing.T) {
 	mockCloud := &testMockCloud{}
 	mapper := &mockMapper{}
-	lockManager := NewLockManagerMap()
+	lockMgr := NewLockManagerMap()
 	metrics := &mockMetricsCollector{}
 
 	options := DefaultProvisionerOptions()
@@ -591,7 +683,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_Success(t *testing.T) {
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      lockManager,
+		lockManager:      &lockMgr,
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
@@ -693,14 +785,14 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_AlreadyExists(t *testing.T) {
 			}, nil
 		},
 	}
-	lockManager := NewLockManagerMap()
+	lockMgr := NewLockManagerMap()
 	metrics := &mockMetricsCollector{}
 
 	options := DefaultProvisionerOptions()
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      lockManager,
+		lockManager:      &lockMgr,
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
@@ -744,7 +836,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_CloudError(t *testing.T) {
 		},
 	}
 	mapper := &mockMapper{}
-	lockManager := NewLockManagerMap()
+	lockMgr := NewLockManagerMap()
 	metrics := &mockMetricsCollector{}
 
 	var errorRecorded bool
@@ -758,7 +850,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_CloudError(t *testing.T) {
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      lockManager,
+		lockManager:      &lockMgr,
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
@@ -794,10 +886,11 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_LockError(t *testing.T) {
 
 	options := DefaultProvisionerOptions()
 	options.CreateTimeout = 1 * time.Millisecond // Very short timeout to force failure
+	lockMgr := NewLockManagerMap()
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      NewLockManagerMap(), // Use default initialization
+		lockManager:      &lockMgr,
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
@@ -842,14 +935,14 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_LockError(t *testing.T) {
 func TestNamespaceProvisioner_CreateNamespaceEFS_DefaultValues(t *testing.T) {
 	mockCloud := &testMockCloud{}
 	mapper := &mockMapper{}
-	lockManager := NewLockManagerMap()
+	lockMgr := NewLockManagerMap()
 	metrics := &mockMetricsCollector{}
 
 	options := DefaultProvisionerOptions()
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
-		lockManager:      lockManager,
+		lockManager:      &lockMgr,
 		metricsCollector: metrics,
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
@@ -1361,5 +1454,460 @@ func TestNamespaceProvisioner_getDefaultSubnets_NoMetadata(t *testing.T) {
 	}
 	if !contains(err.Error(), "metadata service not available") {
 		t.Errorf("Expected error message to mention metadata service, got: %s", err.Error())
+	}
+}
+
+// Access Point Management Tests
+
+func TestNamespaceProvisioner_CreateAccessPointForPVC_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	lockMgr := NewLockManagerMap()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     &lockMgr,
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	// Mock CreateAccessPoint to succeed
+	expectedAccessPoint := &cloud.AccessPoint{
+		AccessPointId: "fsap-12345678",
+		FileSystemId:  "fs-123456789",
+		CapacityGiB:   0,
+	}
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		// Validate the options
+		if opts.FileSystemId != "fs-123456789" {
+			t.Errorf("Expected FileSystemId to be fs-123456789, got %s", opts.FileSystemId)
+		}
+		if opts.Uid <= 0 {
+			t.Errorf("Expected Uid to be positive, got %d", opts.Uid)
+		}
+		if opts.Gid <= 0 {
+			t.Errorf("Expected Gid to be positive, got %d", opts.Gid)
+		}
+		if opts.DirectoryPerms != DefaultDirectoryPerms {
+			t.Errorf("Expected DirectoryPerms to be %s, got %s", DefaultDirectoryPerms, opts.DirectoryPerms)
+		}
+		if opts.DirectoryPath == "" {
+			t.Error("Expected DirectoryPath to be non-empty")
+		}
+		if !contains(opts.DirectoryPath, "test-namespace") {
+			t.Errorf("Expected DirectoryPath to contain namespace, got %s", opts.DirectoryPath)
+		}
+		if !contains(opts.DirectoryPath, "test-pvc") {
+			t.Errorf("Expected DirectoryPath to contain PVC name, got %s", opts.DirectoryPath)
+		}
+		return expectedAccessPoint, nil
+	}
+
+	ctx := context.Background()
+	apOptions := &cloud.AccessPointOptions{
+		FileSystemId: "fs-123456789",
+	}
+
+	result, err := provisioner.CreateAccessPointForPVC(ctx, "test-pvc", "test-namespace", apOptions)
+
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Expected non-nil AccessPoint")
+	}
+	if result.AccessPointId != expectedAccessPoint.AccessPointId {
+		t.Errorf("Expected AccessPointId to be %s, got %s", expectedAccessPoint.AccessPointId, result.AccessPointId)
+	}
+	if result.FileSystemId != expectedAccessPoint.FileSystemId {
+		t.Errorf("Expected FileSystemId to be %s, got %s", expectedAccessPoint.FileSystemId, result.FileSystemId)
+	}
+}
+
+func TestNamespaceProvisioner_CreateAccessPointForPVC_ValidationErrors(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	ctx := context.Background()
+	apOptions := &cloud.AccessPointOptions{
+		FileSystemId: "fs-123456789",
+	}
+
+	tests := []struct {
+		name      string
+		pvcName   string
+		namespace string
+		options   *cloud.AccessPointOptions
+		expectErr string
+	}{
+		{
+			name:      "Empty PVC name",
+			pvcName:   "",
+			namespace: "test-namespace",
+			options:   apOptions,
+			expectErr: "PVC name cannot be empty",
+		},
+		{
+			name:      "Empty namespace",
+			pvcName:   "test-pvc",
+			namespace: "",
+			options:   apOptions,
+			expectErr: "namespace cannot be empty",
+		},
+		{
+			name:      "Nil options",
+			pvcName:   "test-pvc",
+			namespace: "test-namespace",
+			options:   nil,
+			expectErr: "access point options cannot be nil",
+		},
+		{
+			name:      "Empty FileSystemId",
+			pvcName:   "test-pvc",
+			namespace: "test-namespace",
+			options:   &cloud.AccessPointOptions{},
+			expectErr: "FileSystemId must be specified",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := provisioner.CreateAccessPointForPVC(ctx, tt.pvcName, tt.namespace, tt.options)
+			if err == nil {
+				t.Fatalf("Expected error for test %s", tt.name)
+			}
+			if !contains(err.Error(), tt.expectErr) {
+				t.Errorf("Expected error to contain '%s', got: %v", tt.expectErr, err)
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_CreateAccessPointForPVC_CloudError(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	// Mock CreateAccessPoint to fail
+	mockCloud.createAccessPointFunc = func(ctx context.Context, clientToken string, opts *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
+		return nil, fmt.Errorf("AWS API error")
+	}
+
+	ctx := context.Background()
+	apOptions := &cloud.AccessPointOptions{
+		FileSystemId: "fs-123456789",
+	}
+
+	_, err := provisioner.CreateAccessPointForPVC(ctx, "test-pvc", "test-namespace", apOptions)
+
+	if err == nil {
+		t.Fatal("Expected error from cloud provider")
+	}
+	if !contains(err.Error(), "failed to create Access Point for PVC test-pvc") {
+		t.Errorf("Expected error to mention PVC name, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_DeleteAccessPointForPVC_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	// Mock GetNamespaceEFS to return a filesystem
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{
+			{
+				FileSystemId: "fs-123456789",
+			},
+		}, nil
+	}
+
+	// Mock ListAccessPoints and DescribeAccessPoint
+	mockCloud.listAccessPointsFunc = func(ctx context.Context, fileSystemId string) ([]*cloud.AccessPoint, error) {
+		return []*cloud.AccessPoint{
+			{
+				AccessPointId: "fsap-12345678",
+				FileSystemId:  "fs-123456789",
+			},
+		}, nil
+	}
+
+	mockCloud.describeAccessPointFunc = func(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+		return &cloud.AccessPoint{
+			AccessPointId: "fsap-12345678",
+			FileSystemId:  "fs-123456789",
+		}, nil
+	}
+
+	// Mock DeleteAccessPoint to succeed
+	mockCloud.deleteAccessPointFunc = func(ctx context.Context, accessPointId string) error {
+		if accessPointId != "fsap-12345678" {
+			t.Errorf("Expected AccessPointId to be fsap-12345678, got %s", accessPointId)
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	err := provisioner.DeleteAccessPointForPVC(ctx, "test-pvc", "test-namespace")
+
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_DeleteAccessPointForPVC_ValidationErrors(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	ctx := context.Background()
+
+	tests := []struct {
+		name      string
+		pvcName   string
+		namespace string
+		expectErr string
+	}{
+		{
+			name:      "Empty PVC name",
+			pvcName:   "",
+			namespace: "test-namespace",
+			expectErr: "PVC name cannot be empty",
+		},
+		{
+			name:      "Empty namespace",
+			pvcName:   "test-pvc",
+			namespace: "",
+			expectErr: "namespace cannot be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := provisioner.DeleteAccessPointForPVC(ctx, tt.pvcName, tt.namespace)
+			if err == nil {
+				t.Fatalf("Expected error for test %s", tt.name)
+			}
+			if !contains(err.Error(), tt.expectErr) {
+				t.Errorf("Expected error to contain '%s', got: %v", tt.expectErr, err)
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_DeleteAccessPointForPVC_NotFound(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	options := DefaultProvisionerOptions()
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		options:         options,
+		lockManager:     func() *LockManagerMap { lm := NewLockManagerMap(); return &lm }(),
+		metricsCollector: &NoOpMetricsCollector{},
+		mapper:          &testMockMapper{},
+		efsCache:        make(map[string]*CachedEFS),
+	}
+
+	// Mock GetNamespaceEFS to fail (EFS not found)
+	mockCloud.findFileSystemsByTagsFunc = func(ctx context.Context, tags map[string]string) ([]*cloud.FileSystem, error) {
+		return []*cloud.FileSystem{}, nil // No filesystems found
+	}
+
+	ctx := context.Background()
+	err := provisioner.DeleteAccessPointForPVC(ctx, "test-pvc", "test-namespace")
+
+	// Should not error when EFS or AccessPoint is not found
+	if err != nil {
+		t.Fatalf("Expected no error when EFS not found, got: %v", err)
+	}
+}
+
+func TestNamespaceProvisioner_buildAccessPointPath(t *testing.T) {
+	provisioner := &NamespaceProvisioner{}
+
+	tests := []struct {
+		name        string
+		pvcName     string
+		namespace   string
+		options     *cloud.AccessPointOptions
+		expectPath  func(string) bool // Function to validate path
+		expectError bool
+	}{
+		{
+			name:      "Default path construction",
+			pvcName:   "test-pvc",
+			namespace: "test-namespace",
+			options:   &cloud.AccessPointOptions{},
+			expectPath: func(path string) bool {
+				return contains(path, DefaultBasePath) &&
+					contains(path, "test-namespace") &&
+					contains(path, "test-pvc") &&
+					len(path) > len(DefaultBasePath+"/test-namespace/test-pvc/")
+			},
+			expectError: false,
+		},
+		{
+			name:      "Custom directory path",
+			pvcName:   "test-pvc",
+			namespace: "test-namespace",
+			options:   &cloud.AccessPointOptions{DirectoryPath: "/custom/base"},
+			expectPath: func(path string) bool {
+				return contains(path, "/custom/base")
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, err := provisioner.buildAccessPointPath(tt.pvcName, tt.namespace, tt.options)
+
+			if tt.expectError && err == nil {
+				t.Fatalf("Expected error for test %s", tt.name)
+			}
+			if !tt.expectError && err != nil {
+				t.Fatalf("Unexpected error for test %s: %v", tt.name, err)
+			}
+
+			if !tt.expectError {
+				if !tt.expectPath(path) {
+					t.Errorf("Path validation failed for test %s: %s", tt.name, path)
+				}
+				// All paths should start with /
+				if path[0] != '/' {
+					t.Errorf("Expected path to start with '/', got: %s", path)
+				}
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_determinePosixIDs(t *testing.T) {
+	provisioner := &NamespaceProvisioner{}
+
+	tests := []struct {
+		name        string
+		options     *cloud.AccessPointOptions
+		expectUid   int64
+		expectGid   func(int64) bool // Function to validate GID
+		expectError bool
+	}{
+		{
+			name:      "Use specified UID and GID",
+			options:   &cloud.AccessPointOptions{Uid: 2000, Gid: 3000},
+			expectUid: 2000,
+			expectGid: func(gid int64) bool { return gid == 3000 },
+		},
+		{
+			name:      "Use default UID, random GID",
+			options:   &cloud.AccessPointOptions{},
+			expectUid: DefaultUid,
+			expectGid: func(gid int64) bool {
+				return gid >= DefaultGidRangeStart && gid < DefaultGidRangeEnd
+			},
+		},
+		{
+			name:      "Use specified UID, random GID",
+			options:   &cloud.AccessPointOptions{Uid: 1500},
+			expectUid: 1500,
+			expectGid: func(gid int64) bool {
+				return gid >= DefaultGidRangeStart && gid < DefaultGidRangeEnd
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			uid, gid, err := provisioner.determinePosixIDs(tt.options)
+
+			if tt.expectError && err == nil {
+				t.Fatalf("Expected error for test %s", tt.name)
+			}
+			if !tt.expectError && err != nil {
+				t.Fatalf("Unexpected error for test %s: %v", tt.name, err)
+			}
+
+			if !tt.expectError {
+				if uid != tt.expectUid {
+					t.Errorf("Expected UID %d, got %d", tt.expectUid, uid)
+				}
+				if !tt.expectGid(gid) {
+					t.Errorf("GID validation failed for test %s: %d", tt.name, gid)
+				}
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_buildAccessPointTags(t *testing.T) {
+	options := &ProvisionerOptions{
+		DefaultTags: map[string]string{
+			"Environment": "test",
+			"Owner":       "team-a",
+		},
+		ClusterID: "test-cluster",
+	}
+
+	provisioner := &NamespaceProvisioner{
+		options: options,
+	}
+
+	additionalTags := map[string]string{
+		"Custom": "value",
+	}
+
+	tags := provisioner.buildAccessPointTags("test-pvc", "test-namespace", additionalTags)
+
+	expectedTags := map[string]string{
+		"Environment":                           "test",
+		"Owner":                                "team-a",
+		"Custom":                               "value",
+		"kubernetes.io/namespace":              "test-namespace",
+		"kubernetes.io/pvc-name":               "test-pvc",
+		"kubernetes.io/provisioning-mode":      "efs-ns",
+		"kubernetes.io/created-by":             "efs-ns-provisioner",
+		"kubernetes.io/cluster/test-cluster":   "owned",
+	}
+
+	for key, expectedValue := range expectedTags {
+		if actualValue, exists := tags[key]; !exists {
+			t.Errorf("Expected tag %s to exist", key)
+		} else if actualValue != expectedValue {
+			t.Errorf("Expected tag %s to be %s, got %s", key, expectedValue, actualValue)
+		}
+	}
+
+	// Check that we have the expected number of tags
+	if len(tags) != len(expectedTags) {
+		t.Errorf("Expected %d tags, got %d", len(expectedTags), len(tags))
 	}
 }
