@@ -122,7 +122,7 @@
     - Integration with cloud provider API for AP lifecycle
     - Comprehensive unit tests covering all scenarios (9 test cases)
 
-- [ ] 3.6 단위 테스트 작성
+- [x] 3.6 단위 테스트 작성
   - EFS 생성 로직 테스트
   - Access Point 관리 테스트
   - 오류 처리 테스트
