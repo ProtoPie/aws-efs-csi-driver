@@ -655,9 +655,10 @@ func (m *mockLockManager) ReleaseLock(ctx context.Context, key string, lock inte
 }
 
 type mockMetricsCollector struct {
-	incEFSCreatedFunc        func(namespace string)
+	incEFSCreatedFunc         func(namespace string)
 	recordEFSCreationTimeFunc func(namespace string, duration time.Duration)
-	recordErrorFunc          func(operation, namespace string, err error)
+	recordErrorFunc           func(operation, namespace string, err error)
+	incAccessPointDeletedFunc func(namespace string)
 }
 
 func (m *mockMetricsCollector) IncEFSCreated(namespace string) {
@@ -681,7 +682,11 @@ func (m *mockMetricsCollector) RecordError(operation, namespace string, err erro
 // Other required methods
 func (m *mockMetricsCollector) IncEFSDeleted(namespace string) {}
 func (m *mockMetricsCollector) IncAccessPointCreated(namespace string) {}
-func (m *mockMetricsCollector) IncAccessPointDeleted(namespace string) {}
+func (m *mockMetricsCollector) IncAccessPointDeleted(namespace string) {
+	if m.incAccessPointDeletedFunc != nil {
+		m.incAccessPointDeletedFunc(namespace)
+	}
+}
 func (m *mockMetricsCollector) SetActiveNamespaces(count int) {}
 
 // Test cases for CreateNamespaceEFS
@@ -3291,6 +3296,592 @@ func TestNamespaceProvisioner_ParseEFSOptionsFromParams(t *testing.T) {
 
 	if efsOptions.BackupPolicy != "DISABLED" {
 		t.Errorf("Expected backup policy DISABLED, got %s", efsOptions.BackupPolicy)
+	}
+}
+
+// Tests for DeleteNamespaceVolume method
+
+func TestNamespaceProvisioner_DeleteNamespaceVolume_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	accessPointId := "fsap-12345678"
+	namespace := "test-namespace"
+
+	// Mock cloud.DescribeAccessPoint
+	mockCloud.describeAccessPointFunc = func(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+		return &cloud.AccessPoint{
+			AccessPointId:      accessPointId,
+			FileSystemId:       "fs-12345678",
+			AccessPointRootDir: "/dynamic_provisioning/test-namespace/test-pvc/uuid-1234",
+		}, nil
+	}
+
+	// Mock mapper.ListMappings for namespace lookup
+	mapper.listMappingsFunc = func(ctx context.Context) ([]NamespaceEFSMapping, error) {
+		return []NamespaceEFSMapping{
+			{
+				Namespace:     namespace,
+				FileSystemID:  "fs-12345678",
+				FileSystemArn: "arn:aws:elasticfilesystem:us-west-2:123456789012:file-system/fs-12345678",
+				Region:        "us-west-2",
+				CreationTime:  time.Now(),
+			},
+		}, nil
+	}
+
+	// Mock cloud.DeleteAccessPoint
+	var deleteCalled bool
+	var deletedAccessPointId string
+	mockCloud.deleteAccessPointFunc = func(ctx context.Context, apId string) error {
+		deleteCalled = true
+		deletedAccessPointId = apId
+		return nil
+	}
+
+	// Mock mapper.GetMapping for namespace EFS lookup
+	mapper.getMappingFunc = func(ctx context.Context, ns string) (*NamespaceEFSMapping, error) {
+		if ns == namespace {
+			return &NamespaceEFSMapping{
+				Namespace:     ns,
+				FileSystemID:  "fs-12345678",
+				FileSystemArn: "arn:aws:elasticfilesystem:us-west-2:123456789012:file-system/fs-12345678",
+				Region:        "us-west-2",
+			}, nil
+		}
+		return nil, fmt.Errorf("mapping not found")
+	}
+
+	// Mock cloud.ListAccessPoints for cleanup check
+	mockCloud.listAccessPointsFunc = func(ctx context.Context, fsId string) ([]*cloud.AccessPoint, error) {
+		// Return empty list to simulate no remaining access points
+		return []*cloud.AccessPoint{}, nil
+	}
+
+	// Mock cloud.DescribeFileSystem for GetNamespaceEFS
+	mockCloud.describeFileSystemFunc = func(ctx context.Context, fsId string) (*cloud.FileSystem, error) {
+		return &cloud.FileSystem{
+			FileSystemId:   fsId,
+			LifeCycleState: "available",
+		}, nil
+	}
+
+	// Track metrics calls
+	var deletedMetricsCalled bool
+	metrics.incAccessPointDeletedFunc = func(ns string) {
+		if ns == namespace {
+			deletedMetricsCalled = true
+		}
+	}
+
+	req := &csi.DeleteVolumeRequest{
+		VolumeId: accessPointId,
+	}
+
+	ctx := context.Background()
+	resp, err := provisioner.DeleteNamespaceVolume(ctx, req)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Error("Expected response to be non-nil")
+	}
+	if !deleteCalled {
+		t.Error("Expected DeleteAccessPoint to be called")
+	}
+	if deletedAccessPointId != accessPointId {
+		t.Errorf("Expected deleted access point ID to be %s, got %s", accessPointId, deletedAccessPointId)
+	}
+	if !deletedMetricsCalled {
+		t.Error("Expected deleted metrics to be recorded")
+	}
+}
+
+func TestNamespaceProvisioner_DeleteNamespaceVolume_AccessPointNotFound(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	accessPointId := "fsap-12345678"
+
+	// Mock cloud.DescribeAccessPoint to return ErrNotFound
+	mockCloud.describeAccessPointFunc = func(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+		return nil, cloud.ErrNotFound
+	}
+
+	req := &csi.DeleteVolumeRequest{
+		VolumeId: accessPointId,
+	}
+
+	ctx := context.Background()
+	resp, err := provisioner.DeleteNamespaceVolume(ctx, req)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if resp == nil {
+		t.Error("Expected response to be non-nil")
+	}
+}
+
+func TestNamespaceProvisioner_DeleteNamespaceVolume_InvalidRequest(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	tests := []struct {
+		name        string
+		req         *csi.DeleteVolumeRequest
+		expectError string
+	}{
+		{
+			name:        "Nil request",
+			req:         nil,
+			expectError: "DeleteVolumeRequest cannot be nil",
+		},
+		{
+			name: "Empty volume ID",
+			req: &csi.DeleteVolumeRequest{
+				VolumeId: "",
+			},
+			expectError: "volume ID cannot be empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			_, err := provisioner.DeleteNamespaceVolume(ctx, tt.req)
+
+			if err == nil {
+				t.Error("Expected error but got none")
+			}
+			if !contains(err.Error(), tt.expectError) {
+				t.Errorf("Expected error to contain '%s', got: %v", tt.expectError, err)
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_DeleteNamespaceVolume_DeleteAccessPointError(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	accessPointId := "fsap-12345678"
+	namespace := "test-namespace"
+
+	// Mock cloud.DescribeAccessPoint
+	mockCloud.describeAccessPointFunc = func(ctx context.Context, accessPointId string) (*cloud.AccessPoint, error) {
+		return &cloud.AccessPoint{
+			AccessPointId:      accessPointId,
+			FileSystemId:       "fs-12345678",
+			AccessPointRootDir: "/dynamic_provisioning/test-namespace/test-pvc/uuid-1234",
+		}, nil
+	}
+
+	// Mock mapper.ListMappings
+	mapper.listMappingsFunc = func(ctx context.Context) ([]NamespaceEFSMapping, error) {
+		return []NamespaceEFSMapping{
+			{
+				Namespace:    namespace,
+				FileSystemID: "fs-12345678",
+			},
+		}, nil
+	}
+
+	// Mock cloud.DeleteAccessPoint to return error
+	mockCloud.deleteAccessPointFunc = func(ctx context.Context, apId string) error {
+		return fmt.Errorf("AWS API error")
+	}
+
+	// Track error metrics calls
+	var errorRecorded bool
+	metrics.recordErrorFunc = func(operation, ns string, err error) {
+		if operation == "delete_accesspoint" && ns == namespace {
+			errorRecorded = true
+		}
+	}
+
+	req := &csi.DeleteVolumeRequest{
+		VolumeId: accessPointId,
+	}
+
+	ctx := context.Background()
+	_, err := provisioner.DeleteNamespaceVolume(ctx, req)
+
+	if err == nil {
+		t.Error("Expected error but got none")
+	}
+	if !contains(err.Error(), "failed to delete Access Point") {
+		t.Errorf("Expected error to contain 'failed to delete Access Point', got: %v", err)
+	}
+	if !errorRecorded {
+		t.Error("Expected error metrics to be recorded")
+	}
+}
+
+func TestNamespaceProvisioner_DeleteNamespaceVolume_LockTimeout(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+	options.DeleteTimeout = 1 * time.Millisecond // Very short timeout
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	accessPointId := "fsap-12345678"
+
+	// Acquire the lock beforehand to simulate timeout
+	lockKey := fmt.Sprintf("accesspoint-delete:%s", accessPointId)
+	lockMgr.lockMutex(lockKey, 5*time.Second)
+
+	// Track error metrics calls
+	var errorRecorded bool
+	metrics.recordErrorFunc = func(operation, ns string, err error) {
+		if operation == "acquire_delete_lock" {
+			errorRecorded = true
+		}
+	}
+
+	req := &csi.DeleteVolumeRequest{
+		VolumeId: accessPointId,
+	}
+
+	ctx := context.Background()
+	_, err := provisioner.DeleteNamespaceVolume(ctx, req)
+
+	if err == nil {
+		t.Error("Expected error but got none")
+	}
+	if !contains(err.Error(), "failed to acquire lock") {
+		t.Errorf("Expected error to contain 'failed to acquire lock', got: %v", err)
+	}
+	if !errorRecorded {
+		t.Error("Expected error metrics to be recorded")
+	}
+
+	// Cleanup
+	lockMgr.unlockMutex(lockKey)
+}
+
+func TestNamespaceProvisioner_ExtractMetadataFromAccessPoint_Success(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	namespace := "test-namespace"
+	pvcName := "my-pvc"
+
+	// Test with namespace mapper lookup
+	mapper.listMappingsFunc = func(ctx context.Context) ([]NamespaceEFSMapping, error) {
+		return []NamespaceEFSMapping{
+			{
+				Namespace:    namespace,
+				FileSystemID: "fs-12345678",
+			},
+		}, nil
+	}
+
+	accessPoint := &cloud.AccessPoint{
+		AccessPointId:      "fsap-12345678",
+		FileSystemId:       "fs-12345678",
+		AccessPointRootDir: "/dynamic_provisioning/test-namespace/my-pvc/uuid-1234",
+	}
+
+	extractedNamespace, extractedPVC, err := provisioner.extractMetadataFromAccessPoint(accessPoint)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	if extractedNamespace != namespace {
+		t.Errorf("Expected namespace %s, got %s", namespace, extractedNamespace)
+	}
+	if extractedPVC != pvcName {
+		t.Errorf("Expected PVC name %s, got %s", pvcName, extractedPVC)
+	}
+}
+
+func TestNamespaceProvisioner_ExtractMetadataFromAccessPoint_PathExtraction(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{},
+	}
+
+	// Test with mapper lookup failing, fall back to path extraction
+	mapper.listMappingsFunc = func(ctx context.Context) ([]NamespaceEFSMapping, error) {
+		return []NamespaceEFSMapping{}, nil // Empty mappings
+	}
+
+	tests := []struct {
+		name                string
+		path                string
+		expectedNamespace   string
+		expectedPVC         string
+		shouldError         bool
+	}{
+		{
+			name:                "Standard path format",
+			path:                "/dynamic_provisioning/test-namespace/my-pvc/uuid-1234",
+			expectedNamespace:   "test-namespace",
+			expectedPVC:         "my-pvc",
+			shouldError:         false,
+		},
+		{
+			name:                "Path without UUID",
+			path:                "/dynamic_provisioning/prod-ns/important-data",
+			expectedNamespace:   "prod-ns",
+			expectedPVC:         "important-data",
+			shouldError:         false,
+		},
+		{
+			name:                "Invalid path format",
+			path:                "/invalid/path",
+			expectedNamespace:   "",
+			expectedPVC:         "",
+			shouldError:         true,
+		},
+		{
+			name:                "Empty path",
+			path:                "",
+			expectedNamespace:   "",
+			expectedPVC:         "",
+			shouldError:         true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			accessPoint := &cloud.AccessPoint{
+				AccessPointId:      "fsap-12345678",
+				FileSystemId:       "fs-12345678",
+				AccessPointRootDir: tt.path,
+			}
+
+			extractedNamespace, extractedPVC, err := provisioner.extractMetadataFromAccessPoint(accessPoint)
+
+			if tt.shouldError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if extractedNamespace != tt.expectedNamespace {
+					t.Errorf("Expected namespace %s, got %s", tt.expectedNamespace, extractedNamespace)
+				}
+				if extractedPVC != tt.expectedPVC {
+					t.Errorf("Expected PVC name %s, got %s", tt.expectedPVC, extractedPVC)
+				}
+			}
+		})
+	}
+}
+
+func TestNamespaceProvisioner_HandleNamespaceCleanup_NoRemainingAccessPoints(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache:         make(map[string]*CachedEFS),
+		status:           &ProvisionerStatus{ActiveNamespaces: 1},
+	}
+
+	namespace := "test-namespace"
+	deletedAccessPointId := "fsap-12345678"
+
+	// Mock mapper.GetMapping
+	mapper.getMappingFunc = func(ctx context.Context, ns string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    ns,
+			FileSystemID: "fs-12345678",
+		}, nil
+	}
+
+	// Mock cloud.DescribeFileSystem
+	mockCloud.describeFileSystemFunc = func(ctx context.Context, fsId string) (*cloud.FileSystem, error) {
+		return &cloud.FileSystem{
+			FileSystemId:   fsId,
+			LifeCycleState: "available",
+		}, nil
+	}
+
+	// Mock cloud.ListAccessPoints to return empty list (no remaining access points)
+	mockCloud.listAccessPointsFunc = func(ctx context.Context, fsId string) ([]*cloud.AccessPoint, error) {
+		return []*cloud.AccessPoint{}, nil
+	}
+
+	ctx := context.Background()
+	err := provisioner.handleNamespaceCleanup(ctx, namespace, deletedAccessPointId)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Verify that the namespace was removed from cache and metrics updated
+	if _, exists := provisioner.efsCache[namespace]; exists {
+		t.Error("Expected namespace to be removed from cache")
+	}
+	if provisioner.status.ActiveNamespaces != 0 {
+		t.Errorf("Expected ActiveNamespaces to be 0, got %d", provisioner.status.ActiveNamespaces)
+	}
+}
+
+func TestNamespaceProvisioner_HandleNamespaceCleanup_RemainingAccessPoints(t *testing.T) {
+	mockCloud := &testMockCloud{}
+	mapper := &mockMapper{}
+	lockMgr := NewLockManagerMap()
+	metrics := &mockMetricsCollector{}
+	options := DefaultProvisionerOptions()
+
+	provisioner := &NamespaceProvisioner{
+		cloud:            mockCloud,
+		mapper:           mapper,
+		lockManager:      &lockMgr,
+		metricsCollector: metrics,
+		options:          options,
+		efsCache: map[string]*CachedEFS{
+			"test-namespace": {
+				FileSystem: &cloud.FileSystem{FileSystemId: "fs-12345678"},
+				Namespace:  "test-namespace",
+			},
+		},
+		status: &ProvisionerStatus{ActiveNamespaces: 1},
+	}
+
+	namespace := "test-namespace"
+	deletedAccessPointId := "fsap-12345678"
+
+	// Mock mapper.GetMapping
+	mapper.getMappingFunc = func(ctx context.Context, ns string) (*NamespaceEFSMapping, error) {
+		return &NamespaceEFSMapping{
+			Namespace:    ns,
+			FileSystemID: "fs-12345678",
+		}, nil
+	}
+
+	// Mock cloud.DescribeFileSystem
+	mockCloud.describeFileSystemFunc = func(ctx context.Context, fsId string) (*cloud.FileSystem, error) {
+		return &cloud.FileSystem{
+			FileSystemId:   fsId,
+			LifeCycleState: "available",
+		}, nil
+	}
+
+	// Mock cloud.ListAccessPoints to return remaining access points
+	mockCloud.listAccessPointsFunc = func(ctx context.Context, fsId string) ([]*cloud.AccessPoint, error) {
+		return []*cloud.AccessPoint{
+			{
+				AccessPointId: "fsap-other-1234",
+				FileSystemId:  fsId,
+			},
+		}, nil
+	}
+
+	ctx := context.Background()
+	err := provisioner.handleNamespaceCleanup(ctx, namespace, deletedAccessPointId)
+
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	// Verify that the namespace was NOT removed from cache since there are remaining access points
+	if _, exists := provisioner.efsCache[namespace]; !exists {
+		t.Error("Expected namespace to remain in cache when access points exist")
+	}
+	if provisioner.status.ActiveNamespaces != 1 {
+		t.Errorf("Expected ActiveNamespaces to remain 1, got %d", provisioner.status.ActiveNamespaces)
 	}
 }
 

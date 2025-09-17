@@ -137,7 +137,7 @@
   - Access Point 생성 및 PV 바인딩
   - _Requirements: 2.2, 2.3_
 
-- [ ] 4.2 DeleteNamespaceVolume 메서드 구현
+- [x] 4.2 DeleteNamespaceVolume 메서드 구현
   - Access Point 삭제 로직
   - 마지막 PVC 확인 로직
   - 정리 정책 적용 로직

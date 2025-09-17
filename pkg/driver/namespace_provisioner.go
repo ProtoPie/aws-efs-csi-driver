@@ -1003,6 +1003,276 @@ func (np *NamespaceProvisioner) DeleteNamespaceEFS(ctx context.Context, namespac
 	return nil
 }
 
+// DeleteNamespaceVolume implements the namespace-level EFS volume deletion logic
+// This method is called from controller.go when provisioningMode is "efs-ns"
+func (np *NamespaceProvisioner) DeleteNamespaceVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	klog.V(4).Infof("DeleteNamespaceVolume: called with request: %+v", req)
+
+	// Validate input parameters
+	if req == nil {
+		return nil, fmt.Errorf("DeleteVolumeRequest cannot be nil")
+	}
+
+	volumeId := req.GetVolumeId()
+	if volumeId == "" {
+		return nil, fmt.Errorf("volume ID cannot be empty")
+	}
+
+	// In namespace provisioning mode, the volumeId is the Access Point ID
+	accessPointId := volumeId
+
+	klog.V(2).Infof("Deleting namespace volume with Access Point ID: %s", accessPointId)
+
+	// Acquire lock to prevent concurrent operations on the same Access Point
+	lockKey := fmt.Sprintf("accesspoint-delete:%s", accessPointId)
+	if !np.lockManager.lockMutex(lockKey, np.options.DeleteTimeout) {
+		err := fmt.Errorf("failed to acquire lock for deleting Access Point %s within timeout", accessPointId)
+		np.metricsCollector.RecordError("acquire_delete_lock", "unknown", err)
+		return nil, err
+	}
+	defer func() {
+		np.lockManager.unlockMutex(lockKey)
+	}()
+
+	// Get Access Point details to extract namespace and PVC information
+	accessPoint, err := np.cloud.DescribeAccessPoint(ctx, accessPointId)
+	if err != nil {
+		if err == cloud.ErrNotFound {
+			klog.V(2).Infof("Access Point %s not found - assuming already deleted", accessPointId)
+			return &csi.DeleteVolumeResponse{}, nil
+		}
+		np.metricsCollector.RecordError("describe_accesspoint", "unknown", err)
+		return nil, fmt.Errorf("failed to describe Access Point %s: %w", accessPointId, err)
+	}
+
+	// Extract namespace and PVC name from Access Point tags
+	namespace, pvcName, err := np.extractMetadataFromAccessPoint(accessPoint)
+	if err != nil {
+		klog.Warningf("Failed to extract metadata from Access Point %s: %v", accessPointId, err)
+		// Continue with deletion even if we can't extract metadata
+		namespace = "unknown"
+		pvcName = "unknown"
+	}
+
+	klog.V(2).Infof("Deleting Access Point %s for PVC %s in namespace %s", accessPointId, pvcName, namespace)
+
+	// Delete the Access Point
+	if err := np.cloud.DeleteAccessPoint(ctx, accessPointId); err != nil {
+		if err == cloud.ErrNotFound {
+			klog.V(2).Infof("Access Point %s not found - assuming already deleted", accessPointId)
+		} else {
+			np.metricsCollector.RecordError("delete_accesspoint", namespace, err)
+			return nil, fmt.Errorf("failed to delete Access Point %s: %w", accessPointId, err)
+		}
+	} else {
+		// Record successful deletion metrics
+		np.metricsCollector.IncAccessPointDeleted(namespace)
+		klog.V(2).Infof("Successfully deleted Access Point %s for PVC %s in namespace %s", accessPointId, pvcName, namespace)
+	}
+
+	// Check if this was the last Access Point in the namespace
+	// and handle EFS cleanup according to cleanup policy
+	if namespace != "unknown" {
+		if err := np.handleNamespaceCleanup(ctx, namespace, accessPointId); err != nil {
+			klog.Warningf("Failed to handle namespace cleanup for %s: %v", namespace, err)
+			// Don't fail the entire operation for cleanup issues
+		}
+	}
+
+	return &csi.DeleteVolumeResponse{}, nil
+}
+
+// extractMetadataFromAccessPoint extracts namespace and PVC name from Access Point tags
+func (np *NamespaceProvisioner) extractMetadataFromAccessPoint(accessPoint *cloud.AccessPoint) (namespace, pvcName string, err error) {
+	// Strategy 1: Find namespace by filesystem ID using the namespace EFS mapper
+	if accessPoint.FileSystemId != "" {
+		namespace, err = np.findNamespaceByFileSystemID(context.Background(), accessPoint.FileSystemId)
+		if err == nil && namespace != "" {
+			// Extract PVC name from Access Point path if possible
+			pvcName = np.extractPVCNameFromPath(accessPoint.AccessPointRootDir)
+			if pvcName == "" {
+				pvcName = "unknown-pvc"
+			}
+			return namespace, pvcName, nil
+		}
+		klog.V(4).Infof("Failed to find namespace by filesystem ID %s: %v", accessPoint.FileSystemId, err)
+	}
+
+	// Strategy 2: Extract from Access Point path structure if it follows our convention
+	// Our convention: /dynamic_provisioning/namespace/pvcName/uuid
+	namespace, pvcName = np.extractFromPathStructure(accessPoint.AccessPointRootDir)
+	if namespace != "" && pvcName != "" {
+		return namespace, pvcName, nil
+	}
+
+	// Strategy 3: Access Point tags (requires cloud interface extension)
+	// This would be the preferred method but requires extending the cloud.AccessPoint struct
+	// to include tags or adding a new method to get Access Point tags
+	klog.V(4).Infof("Could not extract metadata from Access Point path: %s", accessPoint.AccessPointRootDir)
+
+	return "", "", fmt.Errorf("unable to extract namespace and PVC name from Access Point %s", accessPoint.AccessPointId)
+}
+
+// findNamespaceByFileSystemID finds the namespace that owns a given filesystem ID
+func (np *NamespaceProvisioner) findNamespaceByFileSystemID(ctx context.Context, fileSystemId string) (string, error) {
+	// Get all namespace mappings
+	mappings, err := np.mapper.ListMappings(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to list namespace mappings: %w", err)
+	}
+
+	// Find the mapping with the matching filesystem ID
+	for _, mapping := range mappings {
+		if mapping.FileSystemID == fileSystemId {
+			return mapping.Namespace, nil
+		}
+	}
+
+	return "", fmt.Errorf("no namespace found for filesystem ID %s", fileSystemId)
+}
+
+// extractPVCNameFromPath attempts to extract PVC name from the Access Point path
+func (np *NamespaceProvisioner) extractPVCNameFromPath(path string) string {
+	if path == "" {
+		return ""
+	}
+
+	// Our convention creates paths like: /dynamic_provisioning/namespace/pvc-name/uuid
+	// Try to extract the PVC name from this structure
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+
+	// Expected structure: [dynamic_provisioning, namespace, pvc-name, uuid]
+	if len(pathParts) >= 3 {
+		// The third part should be the PVC name (or volume name)
+		pvcName := pathParts[2]
+
+		// Remove UUID suffix if it exists (UUIDs are 36 characters with dashes)
+		if len(pathParts) == 4 && len(pathParts[3]) == 36 {
+			return pvcName
+		}
+
+		// If no UUID part, try to extract from the pvc name itself if it has UUID suffix
+		if strings.Contains(pvcName, "-") {
+			parts := strings.Split(pvcName, "-")
+			if len(parts) >= 2 {
+				// Remove the last part if it looks like a UUID (length > 30)
+				lastPart := parts[len(parts)-1]
+				if len(lastPart) > 30 {
+					return strings.Join(parts[:len(parts)-1], "-")
+				}
+			}
+		}
+
+		return pvcName
+	}
+
+	return ""
+}
+
+// extractFromPathStructure attempts to extract namespace and PVC name from path structure
+func (np *NamespaceProvisioner) extractFromPathStructure(path string) (namespace, pvcName string) {
+	if path == "" {
+		return "", ""
+	}
+
+	// Our convention creates paths like: /dynamic_provisioning/namespace/pvc-name/uuid
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+
+	// Expected structure: [dynamic_provisioning, namespace, pvc-name, uuid] or similar
+	if len(pathParts) >= 3 {
+		// Skip the first part (base path like "dynamic_provisioning")
+		namespace = pathParts[1]
+		pvcName = pathParts[2]
+
+		// Validate that namespace looks reasonable (basic validation)
+		if len(namespace) > 0 && !strings.Contains(namespace, ".") && len(namespace) < 64 {
+			// Clean up PVC name if it has UUID suffix
+			if len(pathParts) == 4 && len(pathParts[3]) == 36 {
+				// UUID is separate, use pvcName as-is
+				return namespace, pvcName
+			}
+
+			// Try to clean UUID from PVC name if needed
+			cleanPVCName := np.extractPVCNameFromPath(path)
+			if cleanPVCName != "" {
+				pvcName = cleanPVCName
+			}
+
+			return namespace, pvcName
+		}
+	}
+
+	return "", ""
+}
+
+// handleNamespaceCleanup handles cleanup logic for a namespace after Access Point deletion
+func (np *NamespaceProvisioner) handleNamespaceCleanup(ctx context.Context, namespace, deletedAccessPointId string) error {
+	klog.V(4).Infof("Handling namespace cleanup for %s after deleting Access Point %s", namespace, deletedAccessPointId)
+
+	// Get the namespace EFS filesystem
+	filesystem, err := np.GetNamespaceEFS(ctx, namespace)
+	if err != nil {
+		if err.Error() == fmt.Sprintf("no EFS filesystem found for namespace %s", namespace) {
+			klog.V(2).Infof("No EFS filesystem found for namespace %s - cleanup not needed", namespace)
+			return nil
+		}
+		return fmt.Errorf("failed to get namespace EFS for cleanup check: %w", err)
+	}
+
+	// Check if there are any remaining Access Points for this filesystem
+	accessPoints, err := np.cloud.ListAccessPoints(ctx, filesystem.FileSystemId)
+	if err != nil {
+		return fmt.Errorf("failed to list remaining Access Points for filesystem %s: %w", filesystem.FileSystemId, err)
+	}
+
+	// Filter out the Access Point we just deleted (in case of eventual consistency)
+	var remainingAccessPoints []*cloud.AccessPoint
+	for _, ap := range accessPoints {
+		if ap.AccessPointId != deletedAccessPointId {
+			remainingAccessPoints = append(remainingAccessPoints, ap)
+		}
+	}
+
+	klog.V(4).Infof("Found %d remaining Access Points for namespace %s (filesystem %s)",
+		len(remainingAccessPoints), namespace, filesystem.FileSystemId)
+
+	// If no more Access Points remain, handle EFS cleanup according to policy
+	if len(remainingAccessPoints) == 0 {
+		klog.V(2).Infof("No remaining Access Points for namespace %s - considering EFS cleanup", namespace)
+
+		// For now, we implement a "retain" policy by default
+		// In a full implementation, this would check the cleanup policy from storage class parameters
+		cleanupPolicy := "retain" // This should come from storage class parameters
+
+		if cleanupPolicy == "delete" {
+			klog.V(2).Infof("Cleanup policy is 'delete' - would delete EFS %s for namespace %s",
+				filesystem.FileSystemId, namespace)
+			// TODO: Implement EFS deletion logic
+			// This would involve:
+			// 1. Deleting all mount targets
+			// 2. Waiting for mount targets to be deleted
+			// 3. Deleting the EFS filesystem
+			// 4. Removing the namespace mapping
+			// 5. Clearing cache
+		} else {
+			klog.V(2).Infof("Cleanup policy is 'retain' - preserving EFS %s for namespace %s",
+				filesystem.FileSystemId, namespace)
+		}
+
+		// Remove from cache regardless of cleanup policy
+		np.removeCachedEFS(namespace)
+
+		// Update metrics
+		np.updateStatus(func(status *ProvisionerStatus) {
+			if status.ActiveNamespaces > 0 {
+				status.ActiveNamespaces--
+			}
+		})
+	}
+
+	return nil
+}
+
 // CreateAccessPointForPVC creates an Access Point for the given PVC within the namespace EFS
 func (np *NamespaceProvisioner) CreateAccessPointForPVC(ctx context.Context, pvcName, namespace string, options *cloud.AccessPointOptions) (*cloud.AccessPoint, error) {
 	startTime := time.Now()
