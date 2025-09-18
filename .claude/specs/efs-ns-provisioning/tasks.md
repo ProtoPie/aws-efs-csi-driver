@@ -247,17 +247,19 @@
   - **시작 가능 시점**: 작업 2 (NamespaceEFSMapper) 완료 시
 
 ### 8. E2E 테스트 구현
-- [ ] 8.1 전체 워크플로우 테스트
+- [x] 8.1 전체 워크플로우 테스트
   - StorageClass 생성부터 Pod 마운트까지
   - 데이터 읽기/쓰기 검증
   - 권한 및 격리 검증
   - _Requirements: 7.3_
+  - _Completed: Created comprehensive E2E workflow test with complete provisioning flow, failure recovery scenarios, performance testing, data integrity verification, and cleanup testing_
 
-- [ ] 8.2 다중 네임스페이스 격리 테스트
+- [x] 8.2 다중 네임스페이스 격리 테스트
   - 네임스페이스 간 격리 검증
   - 크로스 네임스페이스 접근 차단 테스트
   - POSIX 권한 검증
   - _Requirements: 7.3_
+  - _Completed: Implemented comprehensive multi-namespace isolation tests including EFS isolation, Access Point isolation, cross-namespace prevention, POSIX permissions, network isolation, and edge cases_
 
 - [ ] 8.3 성능 및 스케일 테스트
   - 대량 PVC 생성 성능 테스트
