@@ -19,6 +19,7 @@ package testenv
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -299,6 +300,127 @@ func (h *NamespaceProvisioningTestHelper) GetNamespaceData(namespace string) (*T
 
 	ns, exists := h.namespaces[namespace]
 	return ns, exists
+}
+
+// DeletePVC deletes a PVC from a namespace
+func (h *NamespaceProvisioningTestHelper) DeletePVC(ctx context.Context, namespace, pvcName string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ns, exists := h.namespaces[namespace]
+	if !exists {
+		return fmt.Errorf("namespace %s not found", namespace)
+	}
+
+	// Find and remove the PVC
+	found := false
+	for i, pvc := range ns.PVCs {
+		if pvc.Name == pvcName {
+			// Delete the access point
+			if pvc.AccessPointID != "" {
+				_, err := h.env.efsClient.DeleteAccessPoint(ctx, &efs.DeleteAccessPointInput{
+					AccessPointId: aws.String(pvc.AccessPointID),
+				})
+				if err != nil {
+					klog.Warningf("Failed to delete access point %s: %v", pvc.AccessPointID, err)
+				}
+			}
+
+			// Remove from slice
+			ns.PVCs = append(ns.PVCs[:i], ns.PVCs[i+1:]...)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("PVC %s not found in namespace %s", pvcName, namespace)
+	}
+
+	klog.Infof("Deleted PVC %s from namespace %s", pvcName, namespace)
+	return nil
+}
+
+// GetNamespaceStats returns statistics about a namespace
+func (h *NamespaceProvisioningTestHelper) GetNamespaceStats(namespace string) map[string]interface{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ns, exists := h.namespaces[namespace]
+	if !exists {
+		return nil
+	}
+
+	return map[string]interface{}{
+		"name":         ns.Name,
+		"fileSystemID": ns.FileSystemID,
+		"numPVCs":      len(ns.PVCs),
+		"numAPs":       len(ns.AccessPoints),
+		"createdAt":    ns.CreatedAt,
+	}
+}
+
+// GetAccessPointDetails retrieves details about an access point
+func (h *NamespaceProvisioningTestHelper) GetAccessPointDetails(ctx context.Context, apID string) (*AccessPointDetails, error) {
+	resp, err := h.env.efsClient.DescribeAccessPoints(ctx, &efs.DescribeAccessPointsInput{
+		AccessPointId: aws.String(apID),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(resp.AccessPoints) == 0 {
+		return nil, fmt.Errorf("access point %s not found", apID)
+	}
+
+	ap := resp.AccessPoints[0]
+	return &AccessPointDetails{
+		AccessPointID: *ap.AccessPointId,
+		FileSystemID:  *ap.FileSystemId,
+		Path:          *ap.RootDirectory.Path,
+		LifeCycleState: string(ap.LifeCycleState),
+	}, nil
+}
+
+// AccessPointExists checks if an access point exists
+func (h *NamespaceProvisioningTestHelper) AccessPointExists(ctx context.Context, apID string) (bool, error) {
+	resp, err := h.env.efsClient.DescribeAccessPoints(ctx, &efs.DescribeAccessPointsInput{
+		AccessPointId: aws.String(apID),
+	})
+	if err != nil {
+		// Check if it's a not found error
+		if strings.Contains(err.Error(), "AccessPointNotFound") {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return len(resp.AccessPoints) > 0, nil
+}
+
+// GetEFSTags retrieves tags for an EFS file system
+func (h *NamespaceProvisioningTestHelper) GetEFSTags(ctx context.Context, fsID string) (map[string]string, error) {
+	resp, err := h.env.efsClient.DescribeTags(ctx, &efs.DescribeTagsInput{
+		FileSystemId: aws.String(fsID),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tags := make(map[string]string)
+	for _, tag := range resp.Tags {
+		tags[*tag.Key] = *tag.Value
+	}
+
+	return tags, nil
+}
+
+// AccessPointDetails holds details about an access point
+type AccessPointDetails struct {
+	AccessPointID  string
+	FileSystemID   string
+	Path           string
+	LifeCycleState string
 }
 
 // Helper methods
