@@ -292,6 +292,15 @@ func (h *NamespaceProvisioningTestHelper) CleanupAll(ctx context.Context) error 
 	return lastErr
 }
 
+// GetNamespaceData returns the namespace data if it exists
+func (h *NamespaceProvisioningTestHelper) GetNamespaceData(namespace string) (*TestNamespace, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ns, exists := h.namespaces[namespace]
+	return ns, exists
+}
+
 // Helper methods
 
 func (h *NamespaceProvisioningTestHelper) createNamespaceEFS(ctx context.Context, namespace string) (string, error) {

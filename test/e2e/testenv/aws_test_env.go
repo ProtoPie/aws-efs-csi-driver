@@ -674,3 +674,8 @@ func (env *AWSTestEnvironment) getTags(name string) []ec2types.Tag {
 		},
 	}
 }
+
+// GetEFSClient returns the EFS client for direct access
+func (env *AWSTestEnvironment) GetEFSClient() *efs.Client {
+	return env.efsClient
+}
