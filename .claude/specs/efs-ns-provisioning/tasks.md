@@ -239,7 +239,7 @@
     - Added helper methods: DeletePVC, GetNamespaceStats, GetAccessPointDetails, AccessPointExists, GetEFSTags
     - Metrics collection for race condition detection and performance analysis
 
-- [ ] 7.4 장애 복구 시나리오
+- [x] 7.4 장애 복구 시나리오
   - API 타임아웃 시뮬레이션
   - 부분 실패 복구 테스트
   - CRD 손실 복구 테스트
