@@ -184,11 +184,17 @@
   - efs-ns 모드 감지 로직
   - _Requirements: 4.1, 6.1_
 
-- [ ] 6.2 NamespaceProvisioner 인스턴스 생성
+- [x] 6.2 NamespaceProvisioner 인스턴스 생성
   - Driver 초기화 시 NamespaceProvisioner 생성
   - 의존성 주입 설정
   - 초기화 검증
   - _Requirements: 4.1_
+  - **Completed**: Implemented lazy initialization of NamespaceProvisioner with:
+    - InitializeNamespaceProvisioner method for on-demand creation
+    - GetNamespaceProvisioner method for safe access with auto-initialization
+    - Proper dependency injection using Kubernetes client and config
+    - Graceful shutdown in Driver.Stop() method
+    - Comprehensive unit and integration tests
 
 - [ ] 6.3 조건부 위임 로직 구현
   - efs-ns 모드일 때 NamespaceProvisioner로 위임

@@ -148,10 +148,11 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	// If efs-ns mode, delegate to NamespaceProvisioner
 	if provisioningMode == NamespaceProvisioningMode {
-		if d.namespaceProvisioner == nil {
-			return nil, status.Error(codes.Internal, "NamespaceProvisioner not initialized")
+		provisioner, err := d.GetNamespaceProvisioner()
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "Failed to initialize NamespaceProvisioner: %v", err)
 		}
-		return d.namespaceProvisioner.CreateNamespaceVolume(ctx, req)
+		return provisioner.CreateNamespaceVolume(ctx, req)
 	}
 
 	accessPointsOptions := &cloud.AccessPointOptions{
@@ -440,11 +441,12 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	// In efs-ap mode, volumeId is "fs-xxx::fsap-xxx"
 	if strings.HasPrefix(volId, "fsap-") && !strings.Contains(volId, "::") {
 		// This appears to be an efs-ns volume (just access point ID)
-		if d.namespaceProvisioner != nil {
-			return d.namespaceProvisioner.DeleteNamespaceVolume(ctx, req)
-		} else {
-			klog.Warningf("DeleteVolume: Volume %s appears to be efs-ns mode but NamespaceProvisioner not initialized", volId)
+		provisioner, err := d.GetNamespaceProvisioner()
+		if err != nil {
+			klog.Warningf("DeleteVolume: Volume %s appears to be efs-ns mode but failed to initialize NamespaceProvisioner: %v", volId, err)
 			// Fall through to regular parsing - maybe it's a malformed efs-ap volume
+		} else {
+			return provisioner.DeleteNamespaceVolume(ctx, req)
 		}
 	}
 
