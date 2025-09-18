@@ -196,7 +196,7 @@
     - Graceful shutdown in Driver.Stop() method
     - Comprehensive unit and integration tests
 
-- [ ] 6.3 조건부 위임 로직 구현
+- [x] 6.3 조건부 위임 로직 구현
   - efs-ns 모드일 때 NamespaceProvisioner로 위임
   - 기존 efs-ap 모드 로직 유지
   - 오류 처리 통합
