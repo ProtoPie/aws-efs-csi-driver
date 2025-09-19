@@ -268,7 +268,7 @@
   - _Requirements: 3.2, 7.3_
   - _Completed: Implemented comprehensive performance and benchmark test suites with bulk PVC creation tests, concurrent mount tests, resource monitoring, scale stress tests, and detailed performance reporting_
 
-- [ ] 8.4 크로스 계정 마운트 테스트
+- [x] 8.4 크로스 계정 마운트 테스트
   - 다른 AWS 계정의 EFS 마운트
   - IAM 권한 검증
   - 네트워크 연결성 테스트
