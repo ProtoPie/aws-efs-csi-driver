@@ -341,24 +341,6 @@ func (h *NamespaceProvisioningTestHelper) DeletePVC(ctx context.Context, namespa
 	return nil
 }
 
-// GetNamespaceStats returns statistics about a namespace
-func (h *NamespaceProvisioningTestHelper) GetNamespaceStats(namespace string) map[string]interface{} {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	ns, exists := h.namespaces[namespace]
-	if !exists {
-		return nil
-	}
-
-	return map[string]interface{}{
-		"name":         ns.Name,
-		"fileSystemID": ns.FileSystemID,
-		"numPVCs":      len(ns.PVCs),
-		"numAPs":       len(ns.AccessPoints),
-		"createdAt":    ns.CreatedAt,
-	}
-}
 
 // GetAccessPointDetails retrieves details about an access point
 func (h *NamespaceProvisioningTestHelper) GetAccessPointDetails(ctx context.Context, apID string) (*AccessPointDetails, error) {

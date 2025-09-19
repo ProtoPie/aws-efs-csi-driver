@@ -25,9 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/efs"
-	efstypes "github.com/aws/aws-sdk-go-v2/service/efs/types"
 	"k8s.io/klog/v2"
 )
 

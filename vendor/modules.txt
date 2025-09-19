@@ -14,12 +14,11 @@ github.com/Microsoft/go-winio/pkg/guid
 # github.com/antlr4-go/antlr/v4 v4.13.0
 ## explicit; go 1.20
 github.com/antlr4-go/antlr/v4
-# github.com/aws/aws-sdk-go-v2 v1.31.0
-## explicit; go 1.21
+# github.com/aws/aws-sdk-go-v2 v1.39.0
+## explicit; go 1.22
 github.com/aws/aws-sdk-go-v2/aws
 github.com/aws/aws-sdk-go-v2/aws/defaults
 github.com/aws/aws-sdk-go-v2/aws/middleware
-github.com/aws/aws-sdk-go-v2/aws/middleware/private/metrics
 github.com/aws/aws-sdk-go-v2/aws/protocol/ec2query
 github.com/aws/aws-sdk-go-v2/aws/protocol/query
 github.com/aws/aws-sdk-go-v2/aws/protocol/restjson
@@ -58,11 +57,11 @@ github.com/aws/aws-sdk-go-v2/credentials/stscreds
 ## explicit; go 1.21
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds/internal/config
-# github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.18
-## explicit; go 1.21
+# github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.7
+## explicit; go 1.22
 github.com/aws/aws-sdk-go-v2/internal/configsources
-# github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.18
-## explicit; go 1.21
+# github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.7
+## explicit; go 1.22
 github.com/aws/aws-sdk-go-v2/internal/endpoints/v2
 # github.com/aws/aws-sdk-go-v2/internal/ini v1.8.1
 ## explicit; go 1.21
@@ -77,6 +76,11 @@ github.com/aws/aws-sdk-go-v2/service/ec2/types
 github.com/aws/aws-sdk-go-v2/service/efs
 github.com/aws/aws-sdk-go-v2/service/efs/internal/endpoints
 github.com/aws/aws-sdk-go-v2/service/efs/types
+# github.com/aws/aws-sdk-go-v2/service/iam v1.47.5
+## explicit; go 1.22
+github.com/aws/aws-sdk-go-v2/service/iam
+github.com/aws/aws-sdk-go-v2/service/iam/internal/endpoints
+github.com/aws/aws-sdk-go-v2/service/iam/types
 # github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.11.5
 ## explicit; go 1.21
 github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding
@@ -98,8 +102,8 @@ github.com/aws/aws-sdk-go-v2/service/ssooidc/types
 github.com/aws/aws-sdk-go-v2/service/sts
 github.com/aws/aws-sdk-go-v2/service/sts/internal/endpoints
 github.com/aws/aws-sdk-go-v2/service/sts/types
-# github.com/aws/smithy-go v1.21.0
-## explicit; go 1.21
+# github.com/aws/smithy-go v1.23.0
+## explicit; go 1.22
 github.com/aws/smithy-go
 github.com/aws/smithy-go/auth
 github.com/aws/smithy-go/auth/bearer
@@ -439,6 +443,9 @@ github.com/opencontainers/selinux/pkg/pwalkdir
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
+# github.com/pmezard/go-difflib v1.0.0
+## explicit
+github.com/pmezard/go-difflib/difflib
 # github.com/prometheus/client_golang v1.22.0
 ## explicit; go 1.22
 github.com/prometheus/client_golang/internal/github.com/golang/gddo/httputil
@@ -475,6 +482,11 @@ github.com/spf13/pflag
 # github.com/stoewer/go-strcase v1.3.0
 ## explicit; go 1.11
 github.com/stoewer/go-strcase
+# github.com/stretchr/testify v1.11.1
+## explicit; go 1.17
+github.com/stretchr/testify/assert
+github.com/stretchr/testify/assert/yaml
+github.com/stretchr/testify/require
 # github.com/x448/float16 v0.8.4
 ## explicit; go 1.11
 github.com/x448/float16
