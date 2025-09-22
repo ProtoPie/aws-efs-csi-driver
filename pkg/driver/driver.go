@@ -127,6 +127,10 @@ func (d *Driver) InitializeNamespaceProvisioner() error {
 		options.ClusterID = clusterID
 	}
 
+	// Set region from metadata
+	metadata := d.cloud.GetMetadata()
+	options.Region = metadata.GetRegion()
+
 	// Initialize the NamespaceProvisioner
 	provisioner, err := NewNamespaceProvisioner(d.cloud, k8sClient, config, options)
 	if err != nil {

@@ -30,6 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/efs"
 	"github.com/aws/aws-sdk-go-v2/service/efs/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -81,6 +83,7 @@ type AccessPointOptions struct {
 	// EFS does not consider capacity while provisioning new file systems or access points
 	// Capacity is used to satisfy this test: https://github.com/kubernetes-csi/csi-test/blob/v3.1.1/pkg/sanity/controller.go#L559
 	CapacityGiB    int64
+	Name           string  // Name tag for the access point
 	FileSystemId   string
 	Uid            int64
 	Gid            int64
@@ -90,13 +93,18 @@ type AccessPointOptions struct {
 }
 
 type MountTarget struct {
-	AZName        string
-	AZId          string
-	MountTargetId string
-	IPAddress     string
+	AZName           string
+	AZId             string
+	MountTargetId    string
+	IPAddress        string
+	FileSystemId     string
+	SubnetId         string
+	AvailabilityZone string
+	LifeCycleState   string
 }
 
 type FileSystemOptions struct {
+	Name                         string  // Name tag for the filesystem
 	PerformanceMode               string
 	ThroughputMode               string
 	ProvisionedThroughputInMibps int64
@@ -116,6 +124,17 @@ type Efs interface {
 	DescribeMountTargets(context.Context, *efs.DescribeMountTargetsInput, ...func(*efs.Options)) (*efs.DescribeMountTargetsOutput, error)
 	CreateFileSystem(context.Context, *efs.CreateFileSystemInput, ...func(*efs.Options)) (*efs.CreateFileSystemOutput, error)
 	CreateMountTarget(context.Context, *efs.CreateMountTargetInput, ...func(*efs.Options)) (*efs.CreateMountTargetOutput, error)
+	DeleteFileSystem(context.Context, *efs.DeleteFileSystemInput, ...func(*efs.Options)) (*efs.DeleteFileSystemOutput, error)
+	DeleteMountTarget(context.Context, *efs.DeleteMountTargetInput, ...func(*efs.Options)) (*efs.DeleteMountTargetOutput, error)
+}
+
+type Ec2 interface {
+	DescribeInstances(context.Context, *ec2.DescribeInstancesInput, ...func(*ec2.Options)) (*ec2.DescribeInstancesOutput, error)
+	DescribeSubnets(context.Context, *ec2.DescribeSubnetsInput, ...func(*ec2.Options)) (*ec2.DescribeSubnetsOutput, error)
+	DescribeSecurityGroups(context.Context, *ec2.DescribeSecurityGroupsInput, ...func(*ec2.Options)) (*ec2.DescribeSecurityGroupsOutput, error)
+	DescribeVpcs(context.Context, *ec2.DescribeVpcsInput, ...func(*ec2.Options)) (*ec2.DescribeVpcsOutput, error)
+	CreateSecurityGroup(context.Context, *ec2.CreateSecurityGroupInput, ...func(*ec2.Options)) (*ec2.CreateSecurityGroupOutput, error)
+	AuthorizeSecurityGroupIngress(context.Context, *ec2.AuthorizeSecurityGroupIngressInput, ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
 }
 
 type Cloud interface {
@@ -135,11 +154,21 @@ type Cloud interface {
 	// Tag-based recovery methods for namespace provisioning
 	FindFileSystemsByTags(ctx context.Context, tags map[string]string) (fileSystems []*FileSystem, err error)
 	GetFileSystemTags(ctx context.Context, fileSystemId string) (tags map[string]string, err error)
+	// Network discovery methods for automatic mount target creation
+	GetClusterSubnets(ctx context.Context) (subnets []string, err error)
+	GetClusterSecurityGroup(ctx context.Context) (securityGroupId string, err error)
+	WaitForFileSystemAvailable(ctx context.Context, fileSystemId string) error
+	WaitForMountTargetsAvailable(ctx context.Context, fileSystemId string) error
+	// EFS deletion methods for namespace cleanup
+	DeleteFileSystem(ctx context.Context, fileSystemId string) error
+	ListMountTargets(ctx context.Context, fileSystemId string) (mountTargets []*MountTarget, err error)
+	DeleteMountTarget(ctx context.Context, mountTargetId string) error
 }
 
 type cloud struct {
 	metadata MetadataService
 	efs      Efs
+	ec2      Ec2
 	rm       *retryManager
 }
 
@@ -183,21 +212,63 @@ func createCloud(awsRoleArn string, adaptiveRetryMode bool) (Cloud, error) {
 	efs_client := createEfsClient(awsRoleArn, metadata)
 	klog.V(5).Infof("EFS Client created using the following endpoint: %+v", cfg.BaseEndpoint)
 
+	ec2_client := createEc2Client(awsRoleArn, metadata)
+	klog.V(5).Infof("EC2 Client created for network discovery")
+
 	return &cloud{
 		metadata: metadata,
 		efs:      efs_client,
+		ec2:      ec2_client,
 		rm:       rm,
 	}, nil
 }
 
 func createEfsClient(awsRoleArn string, metadata MetadataService) Efs {
-	cfg, _ := config.LoadDefaultConfig(context.TODO(), config.WithRegion(metadata.GetRegion()))
-	if awsRoleArn != "" {
+	// LoadDefaultConfig automatically handles IRSA when AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are set
+	// For IRSA, the SDK will automatically use the WebIdentityTokenFile provider
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(metadata.GetRegion()))
+	if err != nil {
+		klog.Warningf("Failed to load AWS config: %v", err)
+	}
+
+	// Log which authentication method is being used
+	if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+		klog.V(2).Infof("Using IRSA authentication with role: %s", os.Getenv("AWS_ROLE_ARN"))
+	} else if awsRoleArn != "" {
+		// Only manually assume role if it's NOT an IRSA setup
+		klog.V(2).Infof("Using manual role assumption: %s", awsRoleArn)
 		stsClient := sts.NewFromConfig(cfg)
 		roleProvider := stscreds.NewAssumeRoleProvider(stsClient, awsRoleArn)
 		cfg.Credentials = aws.NewCredentialsCache(roleProvider)
+	} else {
+		klog.V(2).Infof("Using default AWS credentials chain")
 	}
+
 	return efs.NewFromConfig(cfg)
+}
+
+func createEc2Client(awsRoleArn string, metadata MetadataService) Ec2 {
+	// LoadDefaultConfig automatically handles IRSA when AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are set
+	// For IRSA, the SDK will automatically use the WebIdentityTokenFile provider
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(metadata.GetRegion()))
+	if err != nil {
+		klog.Warningf("Failed to load AWS config: %v", err)
+	}
+
+	// Log which authentication method is being used
+	if os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE") != "" {
+		klog.V(2).Infof("EC2 client using IRSA authentication with role: %s", os.Getenv("AWS_ROLE_ARN"))
+	} else if awsRoleArn != "" {
+		// Only manually assume role if it's NOT an IRSA setup
+		klog.V(2).Infof("EC2 client using manual role assumption: %s", awsRoleArn)
+		stsClient := sts.NewFromConfig(cfg)
+		roleProvider := stscreds.NewAssumeRoleProvider(stsClient, awsRoleArn)
+		cfg.Credentials = aws.NewCredentialsCache(roleProvider)
+	} else {
+		klog.V(2).Infof("EC2 client using default AWS credentials chain")
+	}
+
+	return ec2.NewFromConfig(cfg)
 }
 
 func (c *cloud) GetMetadata() MetadataService {
@@ -205,6 +276,14 @@ func (c *cloud) GetMetadata() MetadataService {
 }
 
 func (c *cloud) CreateAccessPoint(ctx context.Context, clientToken string, accessPointOpts *AccessPointOptions) (accessPoint *AccessPoint, err error) {
+	// Add Name tag if specified
+	if accessPointOpts.Name != "" {
+		if accessPointOpts.Tags == nil {
+			accessPointOpts.Tags = make(map[string]string)
+		}
+		accessPointOpts.Tags["Name"] = accessPointOpts.Name
+	}
+
 	efsTags := parseEfsTags(accessPointOpts.Tags)
 	createAPInput := &efs.CreateAccessPointInput{
 		ClientToken:  &clientToken,
@@ -372,6 +451,14 @@ func (c *cloud) ListAccessPoints(ctx context.Context, fileSystemId string) (acce
 }
 
 func (c *cloud) CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (fs *FileSystem, err error) {
+	// Add Name tag if specified
+	if options.Name != "" && options.Tags == nil {
+		options.Tags = make(map[string]string)
+	}
+	if options.Name != "" {
+		options.Tags["Name"] = options.Name
+	}
+
 	efsTags := parseEfsTags(options.Tags)
 	createFsInput := &efs.CreateFileSystemInput{
 		CreationToken: &clientToken,
@@ -506,8 +593,12 @@ func (c *cloud) DescribeFileSystem(ctx context.Context, fileSystemId string) (fs
 	if len(fileSystems) == 0 || len(fileSystems) > 1 {
 		return nil, fmt.Errorf("DescribeFileSystem failed. Expected exactly 1 file system in DescribeFileSystem result. However, recevied %d file systems", len(fileSystems))
 	}
+	fileSystem := res.FileSystems[0]
 	return &FileSystem{
-		FileSystemId: *res.FileSystems[0].FileSystemId,
+		FileSystemId:    *fileSystem.FileSystemId,
+		LifeCycleState:  string(fileSystem.LifeCycleState),
+		PerformanceMode: string(fileSystem.PerformanceMode),
+		ThroughputMode:  string(fileSystem.ThroughputMode),
 	}, nil
 }
 
@@ -833,4 +924,343 @@ func hasAllTags(actualTags, requiredTags map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// GetClusterSubnets automatically discovers cluster subnets from EC2
+func (c *cloud) GetClusterSubnets(ctx context.Context) ([]string, error) {
+	klog.V(4).Infof("Discovering cluster subnets from EC2")
+
+	// Get instance metadata to find VPC
+	instanceId := c.metadata.GetInstanceID()
+	if instanceId == "" {
+		return nil, fmt.Errorf("unable to get instance ID from metadata")
+	}
+
+	// Describe the instance to get VPC and subnet information
+	describeInput := &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceId},
+	}
+
+	result, err := c.ec2.DescribeInstances(ctx, describeInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe instance %s: %w", instanceId, err)
+	}
+
+	if len(result.Reservations) == 0 || len(result.Reservations[0].Instances) == 0 {
+		return nil, fmt.Errorf("no instance found with ID %s", instanceId)
+	}
+
+	instance := result.Reservations[0].Instances[0]
+	vpcId := aws.ToString(instance.VpcId)
+
+	// Get all subnets in the VPC
+	subnetInput := &ec2.DescribeSubnetsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("vpc-id"),
+				Values: []string{vpcId},
+			},
+			{
+				Name:   aws.String("state"),
+				Values: []string{"available"},
+			},
+		},
+	}
+
+	subnetResult, err := c.ec2.DescribeSubnets(ctx, subnetInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe subnets for VPC %s: %w", vpcId, err)
+	}
+
+	// Group subnets by availability zone and pick one per AZ
+	azSubnets := make(map[string]string)
+	for _, subnet := range subnetResult.Subnets {
+		az := aws.ToString(subnet.AvailabilityZone)
+		subnetId := aws.ToString(subnet.SubnetId)
+
+		// Pick private subnets preferentially (they don't have MapPublicIpOnLaunch)
+		if _, exists := azSubnets[az]; !exists || !aws.ToBool(subnet.MapPublicIpOnLaunch) {
+			azSubnets[az] = subnetId
+		}
+	}
+
+	// Convert map to slice
+	subnets := make([]string, 0, len(azSubnets))
+	for _, subnetId := range azSubnets {
+		subnets = append(subnets, subnetId)
+		klog.V(2).Infof("Found subnet %s for mount target creation", subnetId)
+	}
+
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("no subnets found in VPC %s", vpcId)
+	}
+
+	klog.V(2).Infof("Discovered %d subnets across availability zones", len(subnets))
+	return subnets, nil
+}
+
+// GetClusterSecurityGroup gets or creates an appropriate security group for EFS
+func (c *cloud) GetClusterSecurityGroup(ctx context.Context) (string, error) {
+	klog.V(4).Infof("Getting or creating EFS security group")
+
+	// Get instance metadata
+	instanceId := c.metadata.GetInstanceID()
+	if instanceId == "" {
+		return "", fmt.Errorf("unable to get instance ID from metadata")
+	}
+
+	// Describe the instance to get VPC and security group information
+	describeInput := &ec2.DescribeInstancesInput{
+		InstanceIds: []string{instanceId},
+	}
+
+	result, err := c.ec2.DescribeInstances(ctx, describeInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe instance %s: %w", instanceId, err)
+	}
+
+	if len(result.Reservations) == 0 || len(result.Reservations[0].Instances) == 0 {
+		return "", fmt.Errorf("no instance found with ID %s", instanceId)
+	}
+
+	instance := result.Reservations[0].Instances[0]
+	vpcId := aws.ToString(instance.VpcId)
+
+	// Check for existing EFS security group
+	sgInput := &ec2.DescribeSecurityGroupsInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("vpc-id"),
+				Values: []string{vpcId},
+			},
+			{
+				Name:   aws.String("group-name"),
+				Values: []string{"efs-mount-sg"},
+			},
+		},
+	}
+
+	sgResult, err := c.ec2.DescribeSecurityGroups(ctx, sgInput)
+	if err == nil && len(sgResult.SecurityGroups) > 0 {
+		sgId := aws.ToString(sgResult.SecurityGroups[0].GroupId)
+		klog.V(2).Infof("Using existing EFS security group: %s", sgId)
+		return sgId, nil
+	}
+
+	// Create new security group for EFS
+	klog.V(2).Infof("Creating new EFS security group in VPC %s", vpcId)
+
+	// Get VPC CIDR for NFS rule
+	vpcInput := &ec2.DescribeVpcsInput{
+		VpcIds: []string{vpcId},
+	}
+	vpcResult, err := c.ec2.DescribeVpcs(ctx, vpcInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe VPC %s: %w", vpcId, err)
+	}
+
+	if len(vpcResult.Vpcs) == 0 {
+		return "", fmt.Errorf("VPC %s not found", vpcId)
+	}
+
+	vpcCidr := aws.ToString(vpcResult.Vpcs[0].CidrBlock)
+
+	// Create security group
+	createSgInput := &ec2.CreateSecurityGroupInput{
+		GroupName:   aws.String("efs-mount-sg"),
+		Description: aws.String("Security group for EFS mount targets"),
+		VpcId:       aws.String(vpcId),
+	}
+
+	createSgResult, err := c.ec2.CreateSecurityGroup(ctx, createSgInput)
+	if err != nil {
+		return "", fmt.Errorf("failed to create security group: %w", err)
+	}
+
+	sgId := aws.ToString(createSgResult.GroupId)
+
+	// Add NFS ingress rule
+	ingressInput := &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String(sgId),
+		IpPermissions: []ec2types.IpPermission{
+			{
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(2049),
+				ToPort:     aws.Int32(2049),
+				IpRanges: []ec2types.IpRange{
+					{
+						CidrIp:      aws.String(vpcCidr),
+						Description: aws.String("NFS access from VPC"),
+					},
+				},
+			},
+		},
+	}
+
+	_, err = c.ec2.AuthorizeSecurityGroupIngress(ctx, ingressInput)
+	if err != nil {
+		klog.Warningf("Failed to add ingress rule to security group %s: %v", sgId, err)
+		// Continue anyway, the rule might already exist
+	}
+
+	klog.V(2).Infof("Created EFS security group: %s", sgId)
+	return sgId, nil
+}
+
+// WaitForFileSystemAvailable waits for the EFS filesystem to be in available state
+func (c *cloud) WaitForFileSystemAvailable(ctx context.Context, fileSystemId string) error {
+	klog.V(2).Infof("Waiting for EFS filesystem %s to be available", fileSystemId)
+
+	// Poll for up to 2 minutes
+	maxAttempts := 24
+	delay := 5 * time.Second
+
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		klog.V(2).Infof("Attempting to describe filesystem %s (attempt %d/%d)", fileSystemId, i+1, maxAttempts)
+		fs, err := c.DescribeFileSystem(ctx, fileSystemId)
+		if err != nil {
+			klog.V(2).Infof("Failed to describe filesystem %s: %v (attempt %d/%d)", fileSystemId, err, i+1, maxAttempts)
+			// For cross-account scenarios, if we get "Resource not found" repeatedly,
+			// we might need to check if the filesystem exists in the target account
+			if err == ErrNotFound && i > 5 {
+				klog.Warningf("Filesystem %s not found after %d attempts, it might be in a different account", fileSystemId, i+1)
+			}
+			return fmt.Errorf("failed to describe filesystem %s: %w", fileSystemId, err)
+		}
+
+		if fs.LifeCycleState == "available" {
+			klog.V(2).Infof("EFS filesystem %s is now available", fileSystemId)
+			return nil
+		}
+
+		klog.V(4).Infof("EFS filesystem %s is in state %s, waiting... (attempt %d/%d)",
+			fileSystemId, fs.LifeCycleState, i+1, maxAttempts)
+
+		time.Sleep(delay)
+	}
+
+	return fmt.Errorf("timeout waiting for EFS filesystem %s to be available", fileSystemId)
+}
+
+// WaitForMountTargetsAvailable waits for all mount targets of an EFS filesystem to be in available state
+func (c *cloud) WaitForMountTargetsAvailable(ctx context.Context, fileSystemId string) error {
+	klog.V(4).Infof("Waiting for mount targets of EFS filesystem %s to be available", fileSystemId)
+
+	// Poll for up to 3 minutes (mount targets can take longer than EFS creation)
+	maxAttempts := 36
+	delay := 5 * time.Second
+
+	for i := 0; i < maxAttempts; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		mountTargets, err := c.ListMountTargets(ctx, fileSystemId)
+		if err != nil {
+			return fmt.Errorf("failed to list mount targets for filesystem %s: %w", fileSystemId, err)
+		}
+
+		if len(mountTargets) == 0 {
+			klog.V(4).Infof("No mount targets found for EFS filesystem %s, waiting... (attempt %d/%d)",
+				fileSystemId, i+1, maxAttempts)
+			time.Sleep(delay)
+			continue
+		}
+
+		allAvailable := true
+		for _, mt := range mountTargets {
+			if mt.LifeCycleState != "available" {
+				allAvailable = false
+				klog.V(4).Infof("Mount target %s in %s is in state %s, waiting... (attempt %d/%d)",
+					mt.MountTargetId, mt.AvailabilityZone, mt.LifeCycleState, i+1, maxAttempts)
+				break
+			}
+		}
+
+		if allAvailable {
+			klog.V(2).Infof("All mount targets for EFS filesystem %s are now available (%d targets)", fileSystemId, len(mountTargets))
+			return nil
+		}
+
+		time.Sleep(delay)
+	}
+
+	return fmt.Errorf("timeout waiting for mount targets of EFS filesystem %s to be available", fileSystemId)
+}
+
+// DeleteFileSystem deletes an EFS filesystem
+func (c *cloud) DeleteFileSystem(ctx context.Context, fileSystemId string) error {
+	request := &efs.DeleteFileSystemInput{
+		FileSystemId: aws.String(fileSystemId),
+	}
+
+	_, err := c.efs.DeleteFileSystem(ctx, request)
+	if err != nil {
+		return fmt.Errorf("failed to delete EFS filesystem %s: %w", fileSystemId, err)
+	}
+
+	klog.V(2).Infof("Successfully initiated deletion of EFS filesystem: %s", fileSystemId)
+	return nil
+}
+
+// ListMountTargets lists all mount targets for a given EFS filesystem
+func (c *cloud) ListMountTargets(ctx context.Context, fileSystemId string) ([]*MountTarget, error) {
+	request := &efs.DescribeMountTargetsInput{
+		FileSystemId: aws.String(fileSystemId),
+	}
+
+	response, err := c.efs.DescribeMountTargets(ctx, request)
+	if err != nil {
+		// Check if the filesystem was deleted
+		if isFileSystemNotFound(err) {
+			return nil, ErrNotFound
+		}
+		if isAccessDenied(err) {
+			return nil, ErrAccessDenied
+		}
+		return nil, fmt.Errorf("failed to list mount targets for EFS %s: %w", fileSystemId, err)
+	}
+
+	var mountTargets []*MountTarget
+	for _, mt := range response.MountTargets {
+		mountTarget := &MountTarget{
+			MountTargetId:    aws.ToString(mt.MountTargetId),
+			FileSystemId:     aws.ToString(mt.FileSystemId),
+			SubnetId:         aws.ToString(mt.SubnetId),
+			AvailabilityZone: aws.ToString(mt.AvailabilityZoneName),
+			LifeCycleState:   string(mt.LifeCycleState),
+		}
+
+		if mt.IpAddress != nil {
+			mountTarget.IPAddress = aws.ToString(mt.IpAddress)
+		}
+
+		mountTargets = append(mountTargets, mountTarget)
+	}
+
+	klog.V(4).Infof("Found %d mount targets for EFS filesystem %s", len(mountTargets), fileSystemId)
+	return mountTargets, nil
+}
+
+// DeleteMountTarget deletes a mount target
+func (c *cloud) DeleteMountTarget(ctx context.Context, mountTargetId string) error {
+	request := &efs.DeleteMountTargetInput{
+		MountTargetId: aws.String(mountTargetId),
+	}
+
+	_, err := c.efs.DeleteMountTarget(ctx, request)
+	if err != nil {
+		return fmt.Errorf("failed to delete mount target %s: %w", mountTargetId, err)
+	}
+
+	klog.V(2).Infof("Successfully initiated deletion of mount target: %s", mountTargetId)
+	return nil
 }

@@ -1,0 +1,18 @@
+controller:
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::310455165573:role/EFSCSIController"
+  namespaceProvisioning:
+    enabled: true
+
+node:
+  serviceAccount:
+    create: true
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::310455165573:role/EFSCSINode"
+
+image:
+  repository: 310455165573.dkr.ecr.us-west-2.amazonaws.com/aws-efs-csi-driver
+  tag: latest
+  pullPolicy: IfNotPresent

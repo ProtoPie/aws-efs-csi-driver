@@ -455,6 +455,7 @@ func (l *LeaseLock) startRenewal() {
 	}
 
 	l.renewStop = make(chan struct{})
+	renewStopChan := l.renewStop
 	l.leaseMutex.Unlock()
 
 	go func() {
@@ -476,7 +477,7 @@ func (l *LeaseLock) startRenewal() {
 				}
 				cancel()
 
-			case <-l.renewStop:
+			case <-renewStopChan:
 				return
 			}
 		}

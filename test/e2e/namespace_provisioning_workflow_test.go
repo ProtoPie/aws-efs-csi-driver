@@ -47,7 +47,7 @@ func TestComprehensiveWorkflow(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("Complete provisioning workflow", func(t *testing.T) {
@@ -181,7 +181,7 @@ func TestWorkflowWithFailureRecovery(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironmentWithFailureSimulation(t)
+	te, cleanup := setuptestenv.AWSTestEnvironmentWithFailureSimulation(t)
 	defer cleanup()
 
 	t.Run("Workflow with API timeout recovery", func(t *testing.T) {
@@ -303,7 +303,7 @@ func TestWorkflowPerformanceAndScale(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("EFS provisioning performance", func(t *testing.T) {
@@ -444,7 +444,7 @@ func TestWorkflowDataIntegrity(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("Data persistence across pod restarts", func(t *testing.T) {
@@ -557,7 +557,7 @@ func TestWorkflowCleanup(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("Access Point cleanup on PVC deletion", func(t *testing.T) {
@@ -714,7 +714,7 @@ func generateTestData(size int) string {
 }
 
 // Helper function to create namespace provisioning StorageClass
-func createNamespaceProvisioningStorageClass(t *testing.T, te *TestEnvironment) *storagev1.StorageClass {
+func createNamespaceProvisioningStorageClass(t *testing.T, te *testenv.AWSTestEnvironment) *storagev1.StorageClass {
 	sc := &storagev1.StorageClass{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("efs-ns-sc-%s", generateRandomString(6)),
@@ -740,7 +740,7 @@ func createNamespaceProvisioningStorageClass(t *testing.T, te *TestEnvironment) 
 }
 
 // Helper function to create StorageClass with specific cleanup policy
-func createNamespaceProvisioningStorageClassWithPolicy(t *testing.T, te *TestEnvironment, cleanupPolicy string) *storagev1.StorageClass {
+func createNamespaceProvisioningStorageClassWithPolicy(t *testing.T, te *testenv.AWSTestEnvironment, cleanupPolicy string) *storagev1.StorageClass {
 	sc := createNamespaceProvisioningStorageClass(t, te)
 	sc.Parameters["cleanupPolicy"] = cleanupPolicy
 
@@ -751,7 +751,7 @@ func createNamespaceProvisioningStorageClassWithPolicy(t *testing.T, te *TestEnv
 }
 
 // Helper function to get resource metrics
-func getResourceMetrics(t *testing.T, te *TestEnvironment) ResourceMetrics {
+func getResourceMetrics(t *testing.T, te *testenv.AWSTestEnvironment) ResourceMetrics {
 	// This is a simplified version - in real implementation you would
 	// query actual metrics from Prometheus or metrics-server
 	return ResourceMetrics{
@@ -767,7 +767,7 @@ type ResourceMetrics struct {
 }
 
 // Helper function to cleanup EFS manually
-func cleanupEFS(t *testing.T, te *TestEnvironment, efsID string) {
+func cleanupEFS(t *testing.T, te *testenv.AWSTestEnvironment, efsID string) {
 	ctx := context.Background()
 
 	// Delete mount targets first

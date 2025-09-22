@@ -44,7 +44,7 @@ func TestMultiNamespaceIsolation(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("EFS isolation between namespaces", func(t *testing.T) {
@@ -420,7 +420,7 @@ func TestNamespaceIsolationEdgeCases(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	te, cleanup := setupTestEnvironment(t)
+	te, cleanup := setuptestenv.AWSTestEnvironment(t)
 	defer cleanup()
 
 	t.Run("Namespace with special characters", func(t *testing.T) {
@@ -592,7 +592,7 @@ func TestNamespaceIsolationEdgeCases(t *testing.T) {
 }
 
 // Helper function to get mount targets for an EFS
-func getMountTargets(t *testing.T, te *TestEnvironment, efsID string) []efstypes.MountTargetDescription {
+func getMountTargets(t *testing.T, te *testenv.AWSTestEnvironment, efsID string) []efstypes.MountTargetDescription {
 	ctx := context.Background()
 
 	input := &efs.DescribeMountTargetsInput{
@@ -609,7 +609,7 @@ func getMountTargets(t *testing.T, te *TestEnvironment, efsID string) []efstypes
 }
 
 // Helper function to get Access Point details
-func getAccessPointDetails(t *testing.T, te *TestEnvironment, apID string) *efstypes.AccessPointDescription {
+func getAccessPointDetails(t *testing.T, te *testenv.AWSTestEnvironment, apID string) *efstypes.AccessPointDescription {
 	ctx := context.Background()
 
 	input := &efs.DescribeAccessPointsInput{
@@ -630,7 +630,7 @@ func getAccessPointDetails(t *testing.T, te *TestEnvironment, apID string) *efst
 }
 
 // Helper function to get EFS tags
-func getEFSTags(t *testing.T, te *TestEnvironment, efsID string) map[string]string {
+func getEFSTags(t *testing.T, te *testenv.AWSTestEnvironment, efsID string) map[string]string {
 	ctx := context.Background()
 
 	input := &efs.DescribeFileSystemsInput{
@@ -657,7 +657,7 @@ func getEFSTags(t *testing.T, te *TestEnvironment, efsID string) map[string]stri
 }
 
 // Helper function to get namespace EFS if it exists
-func getNamespaceEFSIfExists(t *testing.T, te *TestEnvironment, namespace string) string {
+func getNamespaceEFSIfExists(t *testing.T, te *testenv.AWSTestEnvironment, namespace string) string {
 	// This would query the CRD or AWS tags to find EFS for namespace
 	// Simplified implementation for testing
 	ctx := context.Background()
@@ -680,7 +680,7 @@ func getNamespaceEFSIfExists(t *testing.T, te *TestEnvironment, namespace string
 }
 
 // Helper function to wait for namespace deletion
-func waitForNamespaceDeletion(ctx context.Context, te *TestEnvironment, namespace string, timeout time.Duration) error {
+func waitForNamespaceDeletion(ctx context.Context, te *testenv.AWSTestEnvironment, namespace string, timeout time.Duration) error {
 	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
 		_, err := te.K8sClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
 		if errors.IsNotFound(err) {

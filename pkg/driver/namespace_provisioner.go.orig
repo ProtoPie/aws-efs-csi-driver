@@ -18,10 +18,8 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -31,10 +29,7 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
@@ -47,9 +42,6 @@ import (
 const (
 	// NamespaceProvisioningMode is the provisioning mode for namespace-level EFS
 	NamespaceProvisioningMode = "efs-ns"
-
-	// EFS CSI Driver finalizer for namespace cleanup
-	EFSNamespaceFinalizer = "efs.csi.aws.com/namespace-cleanup"
 
 	// Default configuration values
 	DefaultCacheTimeout     = 5 * time.Minute
@@ -215,7 +207,6 @@ type ProvisionerStatus struct {
 type NamespaceProvisioner struct {
 	// Core dependencies
 	cloud      cloud.Cloud
-	accountID  string
 	k8sClient  kubernetes.Interface
 	config     *rest.Config
 
@@ -241,10 +232,6 @@ type NamespaceProvisioner struct {
 	started    bool
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
-
-	// Namespace deletion monitoring
-	nsWatcher    watch.Interface
-	nsStopCh     chan struct{}
 	startMutex sync.Mutex
 
 	// Metrics and monitoring
@@ -347,24 +334,8 @@ func NewNamespaceProvisioner(cloud cloud.Cloud, k8sClient kubernetes.Interface, 
 	// Initialize volume status tracker
 	statusTracker := NewVolumeStatusTracker(nil, k8sClient) // EventRecorder will be set later
 
-	// Extract account ID from metadata or environment
-	accountID := ""
-	if roleArn := os.Getenv("AWS_ROLE_ARN"); roleArn != "" {
-		// Extract account ID from role ARN: arn:aws:iam::ACCOUNT_ID:role/...
-		parts := strings.Split(roleArn, ":")
-		if len(parts) >= 5 {
-			accountID = parts[4]
-		}
-	}
-	if accountID == "" {
-		// Default to the account ID we know is being used
-		accountID = "310455165573"
-		klog.Warningf("Could not determine AWS account ID from environment, using default: %s", accountID)
-	}
-
 	provisioner := &NamespaceProvisioner{
 		cloud:       cloud,
-		accountID:   accountID,
 		k8sClient:   k8sClient,
 		config:      config,
 		mapper:      mapper,
@@ -451,12 +422,6 @@ func (np *NamespaceProvisioner) Start(ctx context.Context) error {
 		go np.healthCheckLoop()
 	}
 
-	// Start namespace watcher for automatic EFS cleanup
-	if err := np.startNamespaceWatcher(ctx); err != nil {
-		klog.Errorf("Failed to start namespace watcher: %v", err)
-		// Don't fail the entire start process, but log the error
-	}
-
 	// Start cache cleanup if enabled
 	if np.options.EnableCaching {
 		np.wg.Add(1)
@@ -489,14 +454,6 @@ func (np *NamespaceProvisioner) Stop() error {
 
 	// Signal all goroutines to stop
 	close(np.stopCh)
-
-	// Stop namespace watcher
-	if np.nsStopCh != nil {
-		close(np.nsStopCh)
-	}
-	if np.nsWatcher != nil {
-		np.nsWatcher.Stop()
-	}
 
 	// Wait for all goroutines to finish
 	np.wg.Wait()
@@ -683,262 +640,12 @@ func (np *NamespaceProvisioner) removeCachedEFS(namespace string) {
 	delete(np.efsCache, namespace)
 }
 
-// addNamespaceFinalizer adds the EFS finalizer to a namespace
-func (np *NamespaceProvisioner) addNamespaceFinalizer(ctx context.Context, namespace string) error {
-	ns, err := np.k8sClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get namespace %s: %w", namespace, err)
-	}
-
-	// Check if finalizer already exists
-	for _, finalizer := range ns.Finalizers {
-		if finalizer == EFSNamespaceFinalizer {
-			return nil // Already has the finalizer
-		}
-	}
-
-	// Add the finalizer
-	ns.Finalizers = append(ns.Finalizers, EFSNamespaceFinalizer)
-
-	_, err = np.k8sClient.CoreV1().Namespaces().Update(ctx, ns, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to add finalizer to namespace %s: %w", namespace, err)
-	}
-
-	klog.V(2).Infof("Added EFS finalizer to namespace %s", namespace)
-	return nil
-}
-
-// removeNamespaceFinalizer removes the EFS finalizer from a namespace
-func (np *NamespaceProvisioner) removeNamespaceFinalizer(ctx context.Context, namespace string) error {
-	ns, err := np.k8sClient.CoreV1().Namespaces().Get(ctx, namespace, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get namespace %s: %w", namespace, err)
-	}
-
-	// Remove the finalizer
-	var updatedFinalizers []string
-	for _, finalizer := range ns.Finalizers {
-		if finalizer != EFSNamespaceFinalizer {
-			updatedFinalizers = append(updatedFinalizers, finalizer)
-		}
-	}
-
-	ns.Finalizers = updatedFinalizers
-
-	_, err = np.k8sClient.CoreV1().Namespaces().Update(ctx, ns, metav1.UpdateOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to remove finalizer from namespace %s: %w", namespace, err)
-	}
-
-	klog.V(2).Infof("Removed EFS finalizer from namespace %s", namespace)
-	return nil
-}
-
-// startNamespaceWatcher starts watching for namespace deletion events
-func (np *NamespaceProvisioner) startNamespaceWatcher(ctx context.Context) error {
-	klog.V(2).Info("Starting namespace watcher for EFS cleanup")
-
-	// Create a watch for namespace events
-	watchOptions := metav1.ListOptions{
-		Watch: true,
-	}
-
-	watcher, err := np.k8sClient.CoreV1().Namespaces().Watch(ctx, watchOptions)
-	if err != nil {
-		return fmt.Errorf("failed to create namespace watcher: %w", err)
-	}
-
-	np.nsWatcher = watcher
-	np.nsStopCh = make(chan struct{})
-
-	// Start the watch loop in a goroutine
-	np.wg.Add(1)
-	go func() {
-		defer np.wg.Done()
-		defer watcher.Stop()
-
-		for {
-			select {
-			case event, ok := <-watcher.ResultChan():
-				if !ok {
-					klog.V(4).Info("Namespace watcher channel closed, restarting...")
-					// Try to restart the watcher
-					if err := np.restartNamespaceWatcher(ctx); err != nil {
-						klog.Errorf("Failed to restart namespace watcher: %v", err)
-					}
-					return
-				}
-
-				if event.Type == watch.Modified || event.Type == watch.Deleted {
-					ns, ok := event.Object.(*corev1.Namespace)
-					if !ok {
-						continue
-					}
-
-					// Check if namespace has our finalizer and is being deleted
-					if ns.DeletionTimestamp != nil && np.hasEFSFinalizer(ns) {
-						klog.V(2).Infof("Detected namespace deletion with EFS finalizer: %s", ns.Name)
-						go np.handleNamespaceDeletion(ctx, ns.Name)
-					}
-				}
-
-			case <-np.nsStopCh:
-				klog.V(2).Info("Namespace watcher stopped")
-				return
-
-			case <-ctx.Done():
-				klog.V(2).Info("Namespace watcher context done")
-				return
-			}
-		}
-	}()
-
-	return nil
-}
-
-// restartNamespaceWatcher restarts the namespace watcher after a failure
-func (np *NamespaceProvisioner) restartNamespaceWatcher(ctx context.Context) error {
-	if np.nsWatcher != nil {
-		np.nsWatcher.Stop()
-	}
-
-	// Wait a bit before restarting
-	time.Sleep(5 * time.Second)
-
-	return np.startNamespaceWatcher(ctx)
-}
-
-// hasEFSFinalizer checks if a namespace has the EFS finalizer
-func (np *NamespaceProvisioner) hasEFSFinalizer(ns *corev1.Namespace) bool {
-	for _, finalizer := range ns.Finalizers {
-		if finalizer == EFSNamespaceFinalizer {
-			return true
-		}
-	}
-	return false
-}
-
-// hasActivePVsInNamespace checks if there are any active PVCs in the namespace that would use EFS resources
-func (np *NamespaceProvisioner) hasActivePVsInNamespace(ctx context.Context, namespace string) (bool, error) {
-	// List all PVCs in the namespace (including those being deleted)
-	pvcList, err := np.k8sClient.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list PVCs in namespace %s: %w", namespace, err)
-	}
-
-	// Check if any PVCs exist (even if they're terminating)
-	for _, pvc := range pvcList.Items {
-		// Check if this PVC uses our EFS storage class
-		if pvc.Spec.StorageClassName != nil {
-			var storageClass *storagev1.StorageClass
-			storageClass, err = np.k8sClient.StorageV1().StorageClasses().Get(ctx, *pvc.Spec.StorageClassName, metav1.GetOptions{})
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					klog.V(4).Infof("StorageClass %s not found for PVC %s/%s", *pvc.Spec.StorageClassName, namespace, pvc.Name)
-					continue
-				}
-				return false, fmt.Errorf("failed to get StorageClass %s: %w", *pvc.Spec.StorageClassName, err)
-			}
-
-			// Check if this is an EFS CSI driver storage class with namespace provisioning
-			if storageClass.Provisioner == "efs.csi.aws.com" {
-				if provisioningMode, exists := storageClass.Parameters["provisioningMode"]; exists && provisioningMode == "efs-ns" {
-					// Don't skip terminating PVCs - they still need the EFS filesystem
-					if pvc.DeletionTimestamp != nil {
-						klog.V(2).Infof("Found terminating EFS namespace-provisioned PVC %s/%s, waiting for it to be fully deleted before removing EFS", namespace, pvc.Name)
-					} else {
-						klog.V(2).Infof("Found active EFS namespace-provisioned PVC %s/%s", namespace, pvc.Name)
-					}
-					return true, nil
-				}
-			}
-		}
-	}
-
-	// Also check if any PVs are still referencing this namespace's EFS
-	pvList, err := np.k8sClient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return false, fmt.Errorf("failed to list PVs: %w", err)
-	}
-
-	// Get the EFS filesystem ID for this namespace
-	filesystem, err := np.GetNamespaceEFS(ctx, namespace)
-	if err != nil && err != cloud.ErrNotFound {
-		return false, fmt.Errorf("failed to get EFS filesystem for namespace %s: %w", namespace, err)
-	}
-
-	if filesystem != nil {
-		filesystemId := filesystem.FileSystemId
-
-		for _, pv := range pvList.Items {
-			// Check if this PV is for our namespace's EFS
-			if pv.Spec.CSI != nil && pv.Spec.CSI.Driver == "efs.csi.aws.com" {
-				if fsId, exists := pv.Spec.CSI.VolumeAttributes["filesystem"]; exists && fsId == filesystemId {
-					// Check if the PV is still bound or being deleted
-					if pv.Status.Phase == corev1.VolumeBound || pv.Status.Phase == corev1.VolumeReleased || pv.DeletionTimestamp != nil {
-						klog.V(2).Infof("Found PV %s still using EFS %s for namespace %s (phase: %s, deletion: %v)",
-							pv.Name, filesystemId, namespace, pv.Status.Phase, pv.DeletionTimestamp != nil)
-						return true, nil
-					}
-				}
-			}
-		}
-	}
-
-	klog.V(2).Infof("No active PVCs or PVs found for namespace %s, safe to delete EFS", namespace)
-	return false, nil
-}
-
-// handleNamespaceDeletion handles the cleanup when a namespace with EFS finalizer is being deleted
-func (np *NamespaceProvisioner) handleNamespaceDeletion(ctx context.Context, namespace string) {
-	klog.V(2).Infof("Starting EFS cleanup check for namespace deletion: %s", namespace)
-
-	// Create a timeout context for cleanup operations
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), np.options.CleanupTimeout)
-	defer cancel()
-
-	// Check if there are any PVs still claiming resources in this namespace
-	hasActivePVs, err := np.hasActivePVsInNamespace(cleanupCtx, namespace)
-	if err != nil {
-		klog.Errorf("Failed to check active PVs for namespace %s: %v", namespace, err)
-		// Don't proceed with cleanup if we can't verify PV status
-		return
-	}
-
-	if hasActivePVs {
-		klog.V(2).Infof("Namespace %s still has active PVs, skipping EFS deletion. Finalizer will remain until all PVs are deleted.", namespace)
-		// Keep the finalizer - don't delete EFS yet
-		return
-	}
-
-	klog.V(2).Infof("No active PVs found in namespace %s, proceeding with EFS cleanup", namespace)
-
-	// Clean up EFS resources for the namespace
-	if err := np.DeleteNamespaceEFS(cleanupCtx, namespace); err != nil {
-		klog.Errorf("Failed to delete EFS for namespace %s: %v", namespace, err)
-		// Don't remove finalizer if cleanup failed
-		return
-	}
-
-	// Remove the finalizer to allow namespace deletion to proceed
-	if err := np.removeNamespaceFinalizer(cleanupCtx, namespace); err != nil {
-		klog.Errorf("Failed to remove finalizer from namespace %s: %v", namespace, err)
-	} else {
-		klog.V(2).Infof("Successfully cleaned up EFS and removed finalizer for namespace: %s", namespace)
-	}
-}
-
 // CreateNamespaceEFS creates an EFS filesystem for the given namespace
 func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespace string, options *EFSOptions) (*cloud.FileSystem, error) {
 	startTime := time.Now()
-	
-	// Create a new context with a longer timeout for AWS operations
-	awsCtx, awsCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer awsCancel()
 
 	// Check if EFS already exists for this namespace
-	existing, err := np.GetNamespaceEFS(awsCtx, namespace)
+	existing, err := np.GetNamespaceEFS(ctx, namespace)
 	if err == nil && existing != nil {
 		klog.V(2).Infof("EFS filesystem already exists for namespace %s: %s", namespace, existing.FileSystemId)
 		return existing, nil
@@ -956,7 +663,7 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 	}()
 
 	// Double-check if EFS was created while waiting for lock
-	existing, err = np.GetNamespaceEFS(awsCtx, namespace)
+	existing, err = np.GetNamespaceEFS(ctx, namespace)
 	if err == nil && existing != nil {
 		klog.V(2).Infof("EFS filesystem was created by another process for namespace %s: %s", namespace, existing.FileSystemId)
 		return existing, nil
@@ -987,9 +694,8 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 		tags[fmt.Sprintf("kubernetes.io/cluster/%s", np.options.ClusterID)] = "owned"
 	}
 
-	// Build FileSystemOptions with namespace as Name
+	// Build FileSystemOptions
 	fsOptions := &cloud.FileSystemOptions{
-		Name: namespace, // Set filesystem Name to namespace
 		Tags: tags,
 	}
 
@@ -1019,10 +725,10 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 
 	// Create the EFS filesystem with retry logic
 	strategy := retry.EFSProvisioningStrategy()
-	filesystem, err := retry.DoWithResultAndName(awsCtx, strategy,
+	filesystem, err := retry.DoWithResultAndName(ctx, strategy,
 		fmt.Sprintf("create-efs-%s", namespace),
 		func() (*cloud.FileSystem, error) {
-			return np.cloud.CreateFileSystem(awsCtx, clientToken, fsOptions)
+			return np.cloud.CreateFileSystem(ctx, clientToken, fsOptions)
 		})
 	if err != nil {
 		np.metricsCollector.RecordError("create_filesystem", namespace, err)
@@ -1037,39 +743,19 @@ func (np *NamespaceProvisioner) CreateNamespaceEFS(ctx context.Context, namespac
 		filesystem.FileSystemId, namespace, time.Since(startTime))
 
 	// Store the mapping in the namespace EFS mapper
-	// Create ARN with actual account ID
-	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:%s:file-system/%s", np.options.Region, np.accountID, filesystem.FileSystemId)
-	if _, err := np.mapper.CreateOrUpdateMapping(awsCtx, namespace, filesystem.FileSystemId, fileSystemArn, np.options.Region); err != nil {
+	// TODO: Replace with actual account ID from STS GetCallerIdentity
+	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:123456789012:file-system/%s", np.options.Region, filesystem.FileSystemId)
+	if _, err := np.mapper.CreateOrUpdateMapping(ctx, namespace, filesystem.FileSystemId, fileSystemArn, np.options.Region); err != nil {
 		klog.Warningf("Failed to store namespace mapping for %s -> %s: %v", namespace, filesystem.FileSystemId, err)
 		// Don't fail the entire operation, the mapping can be recovered from tags
 	}
 
-	// Add finalizer to namespace to enable EFS cleanup on namespace deletion
-	if err := np.addNamespaceFinalizer(ctx, namespace); err != nil {
-		klog.Warningf("Failed to add finalizer to namespace %s: %v", namespace, err)
-		// Don't fail the operation, but log the warning as this affects cleanup
+	// Create mount targets for the EFS filesystem
+	if err := np.createMountTargetsForEFS(ctx, filesystem.FileSystemId, namespace); err != nil {
+		klog.Warningf("Failed to create mount targets for EFS %s in namespace %s: %v", filesystem.FileSystemId, namespace, err)
+		// Don't fail the entire operation as mount targets can be created later
+		// The node service will handle cases where mount targets don't exist yet
 	}
-
-	// Create mount targets asynchronously to avoid blocking volume creation
-	go func() {
-		// Create a new background context with longer timeout for mount target creation
-		mountTargetCtx, mountTargetCancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer mountTargetCancel()
-
-		// Wait for EFS to be available before creating mount targets
-		klog.V(2).Infof("Waiting for EFS filesystem %s to become available for mount target creation", filesystem.FileSystemId)
-		if err := np.cloud.WaitForFileSystemAvailable(mountTargetCtx, filesystem.FileSystemId); err != nil {
-			klog.Errorf("Failed to wait for EFS filesystem %s to be available: %v", filesystem.FileSystemId, err)
-			return
-		}
-
-		klog.Infof("EFS filesystem %s is available, initiating mount target creation", filesystem.FileSystemId)
-		if err := np.createMountTargetsForEFS(mountTargetCtx, filesystem.FileSystemId, namespace); err != nil {
-			klog.Errorf("Failed to create mount targets for EFS %s in namespace %s: %v", filesystem.FileSystemId, namespace, err)
-		} else {
-			klog.Infof("Successfully initiated mount target creation for EFS %s", filesystem.FileSystemId)
-		}
-	}()
 
 	// Cache the filesystem
 	np.setCachedEFS(namespace, filesystem)
@@ -1128,7 +814,8 @@ func (np *NamespaceProvisioner) GetNamespaceEFS(ctx context.Context, namespace s
 	filesystem := fileSystems[0]
 
 	// Update the mapping if it was missing
-	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:%s:file-system/%s", np.options.Region, np.accountID, filesystem.FileSystemId)
+	// TODO: Replace with actual account ID from STS GetCallerIdentity
+	fileSystemArn := fmt.Sprintf("arn:aws:elasticfilesystem:%s:123456789012:file-system/%s", np.options.Region, filesystem.FileSystemId)
 	if _, err := np.mapper.CreateOrUpdateMapping(ctx, namespace, filesystem.FileSystemId, fileSystemArn, np.options.Region); err != nil {
 		klog.Warningf("Failed to restore namespace mapping for %s -> %s: %v", namespace, filesystem.FileSystemId, err)
 	}
@@ -1142,39 +829,30 @@ func (np *NamespaceProvisioner) GetNamespaceEFS(ctx context.Context, namespace s
 // createMountTargetsForEFS creates mount targets for the given EFS filesystem
 // This ensures multi-AZ availability for the EFS filesystem
 func (np *NamespaceProvisioner) createMountTargetsForEFS(ctx context.Context, fileSystemId, namespace string) error {
-	klog.Infof("Creating mount targets for EFS %s in namespace %s", fileSystemId, namespace)
+	klog.V(2).Infof("Creating mount targets for EFS %s in namespace %s", fileSystemId, namespace)
 
 	// Check if mount targets already exist
 	existingMT, err := np.cloud.DescribeMountTargets(ctx, fileSystemId, "")
-	if err != nil {
-		klog.Warningf("Failed to describe existing mount targets for EFS %s: %v", fileSystemId, err)
-		// Continue anyway - might be cross-account issue
-	} else if existingMT != nil {
-		klog.Infof("Mount targets already exist for EFS %s", fileSystemId)
+	if err == nil && existingMT != nil {
+		klog.V(2).Infof("Mount targets already exist for EFS %s", fileSystemId)
 		return nil
 	}
 
 	// Get available subnets for mount target creation
-	klog.Infof("Getting available subnets for mount target creation")
 	subnets, err := np.getAvailableSubnets(ctx)
 	if err != nil {
-		klog.Errorf("Failed to get available subnets: %v", err)
 		return fmt.Errorf("failed to get available subnets: %w", err)
 	}
 
-	klog.Infof("Found %d available subnets for mount target creation", len(subnets))
 	if len(subnets) == 0 {
 		return fmt.Errorf("no available subnets found for mount target creation")
 	}
 
 	// Get default security group for EFS
-	klog.Infof("Getting EFS security group")
 	securityGroupId, err := np.getEFSSecurityGroup(ctx)
 	if err != nil {
 		klog.Warningf("Failed to get EFS security group, proceeding without security group: %v", err)
 		securityGroupId = "" // EFS will use the default VPC security group
-	} else {
-		klog.Infof("Using security group %s for mount targets", securityGroupId)
 	}
 
 	// Create mount targets in multiple subnets for high availability
@@ -1189,12 +867,11 @@ func (np *NamespaceProvisioner) createMountTargetsForEFS(ctx context.Context, fi
 
 	for i := 0; i < maxMountTargets; i++ {
 		subnet := subnets[i]
-		klog.Infof("Creating mount target for EFS %s in subnet %s (AZ: %s)", fileSystemId, subnet.SubnetId, subnet.AvailabilityZone)
+		klog.V(4).Infof("Creating mount target for EFS %s in subnet %s (AZ: %s)", fileSystemId, subnet.SubnetId, subnet.AvailabilityZone)
 
 		// Create mount target with retry logic
 		mountTarget, err := np.createMountTargetWithRetry(ctx, fileSystemId, subnet.SubnetId, securityGroupId)
 		if err != nil {
-			klog.Errorf("Failed to create mount target in subnet %s: %v", subnet.SubnetId, err)
 			createErrors = append(createErrors, fmt.Errorf("failed to create mount target in subnet %s: %w", subnet.SubnetId, err))
 			continue
 		}
@@ -1369,64 +1046,30 @@ func (np *NamespaceProvisioner) discoverSubnetsFromExistingEFS(ctx context.Conte
 
 // getDefaultSubnets returns default subnets based on cluster metadata
 func (np *NamespaceProvisioner) getDefaultSubnets(ctx context.Context) ([]*SubnetInfo, error) {
-	klog.V(4).Infof("Using automatic subnet discovery from EC2")
+	klog.V(4).Infof("Using default subnet strategy based on instance metadata")
 
-	// Use cloud interface to automatically discover cluster subnets
-	subnetIds, err := np.cloud.GetClusterSubnets(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover cluster subnets: %w", err)
+	// Get current instance availability zone from metadata
+	metadata := np.cloud.GetMetadata()
+	if metadata == nil {
+		return nil, fmt.Errorf("metadata service not available for subnet detection")
 	}
 
-	// Convert string slice to SubnetInfo structs
-	var subnets []*SubnetInfo
-	for _, subnetId := range subnetIds {
-		subnets = append(subnets, &SubnetInfo{
-			SubnetId: subnetId,
-		})
+	currentAZ := metadata.GetAvailabilityZone()
+	if currentAZ == "" {
+		return nil, fmt.Errorf("current availability zone not available from metadata")
 	}
 
-	klog.V(2).Infof("Automatically discovered %d subnets from cluster", len(subnets))
-	return subnets, nil
-}
+	// Create a placeholder subnet for the current AZ
+	// In a real implementation, this would:
+	// 1. Query EC2 to find subnets in the current VPC
+	// 2. Filter by availability zones
+	// 3. Return actual subnet IDs
 
-// getSubnetsFromInstance queries EC2 to get subnet information from the instance
-func (np *NamespaceProvisioner) getSubnetsFromInstance(ctx context.Context, instanceId, region string) ([]*SubnetInfo, error) {
-	// For now, we'll use environment variables or configuration to get subnet information
-	// In a production environment, this would query EC2 using the AWS SDK
+	// For now, return placeholder that will cause graceful handling
+	klog.V(2).Infof("Current AZ from metadata: %s", currentAZ)
+	klog.Warningf("Default subnet strategy requires EC2 integration - mount targets must be created manually or configured via options")
 
-	// Check if we have subnet configuration from environment
-	if envSubnets := os.Getenv("EFS_CSI_SUBNETS"); envSubnets != "" {
-		subnets := strings.Split(envSubnets, ",")
-		var subnetInfos []*SubnetInfo
-		for _, subnetId := range subnets {
-			subnetInfos = append(subnetInfos, &SubnetInfo{
-				SubnetId: strings.TrimSpace(subnetId),
-			})
-		}
-		klog.V(2).Infof("Using subnets from environment: %v", subnets)
-		return subnetInfos, nil
-	}
-
-	// Fall back to getting subnet from instance metadata
-	// This would normally use EC2 DescribeInstances API
-	klog.V(4).Infof("Would query EC2 for instance %s in region %s to get subnet info", instanceId, region)
-
-	// Return error to fall back to manual configuration
-	return nil, fmt.Errorf("EC2 integration not available - please configure subnets via environment variable EFS_CSI_SUBNETS")
-}
-
-// getSecurityGroupFromInstance gets the security group from the current instance
-func (np *NamespaceProvisioner) getSecurityGroupFromInstance(ctx context.Context, instanceId, region string) (string, error) {
-	// Check if we have security group configuration from environment
-	if envSG := os.Getenv("EFS_CSI_SECURITY_GROUP"); envSG != "" {
-		klog.V(2).Infof("Using security group from environment: %s", envSG)
-		return envSG, nil
-	}
-
-	// This would normally use EC2 DescribeInstances API
-	klog.V(4).Infof("Would query EC2 for instance %s in region %s to get security group", instanceId, region)
-
-	return "", fmt.Errorf("EC2 integration not available - please configure security group via environment variable EFS_CSI_SECURITY_GROUP")
+	return []*SubnetInfo{}, fmt.Errorf("automatic subnet discovery requires EC2 integration - please configure subnets manually")
 }
 
 // getEFSSecurityGroup gets the security group for EFS mount targets
@@ -1439,197 +1082,25 @@ func (np *NamespaceProvisioner) getEFSSecurityGroup(ctx context.Context) (string
 		return np.options.SecurityGroupId, nil
 	}
 
-	// Strategy 2: Use automatic discovery from cloud interface
-	securityGroupId, err := np.cloud.GetClusterSecurityGroup(ctx)
-	if err != nil {
-		klog.Warningf("Failed to discover/create security group: %v", err)
-		klog.Warningf("Using default security group - manual NFS rule configuration may be required")
-		return "", nil
-	}
+	// Strategy 2: Look for existing EFS security groups by tags
+	// TODO: Implement EC2 security group discovery
+	// This would search for security groups with specific tags like:
+	// - kubernetes.io/cluster/<cluster-id>
+	// - kubernetes.io/service/efs
 
-	klog.V(2).Infof("Using automatically discovered/created security group: %s", securityGroupId)
-	return securityGroupId, nil
+	// Strategy 3: Use default VPC security group
+	klog.V(2).Infof("No security group configured, using default VPC security group")
+	klog.Warningf("Using default security group may require manual NFS rule configuration")
+
+	return "", nil // Empty string will use default VPC security group
 }
 
 // DeleteNamespaceEFS deletes the EFS filesystem for the given namespace
 func (np *NamespaceProvisioner) DeleteNamespaceEFS(ctx context.Context, namespace string) error {
-	klog.V(2).Infof("Starting EFS deletion for namespace: %s", namespace)
-
-	// Get EFS filesystem for this namespace
-	filesystem, err := np.GetNamespaceEFS(ctx, namespace)
-	if err != nil {
-		if err == cloud.ErrNotFound {
-			klog.V(2).Infof("EFS filesystem not found for namespace %s - assuming already deleted", namespace)
-			return nil
-		}
-		return fmt.Errorf("failed to get EFS filesystem for namespace %s: %w", namespace, err)
-	}
-
-	if filesystem == nil {
-		klog.V(2).Infof("No EFS filesystem found for namespace %s", namespace)
-		return nil
-	}
-
-	fileSystemId := filesystem.FileSystemId
-	klog.V(2).Infof("Found EFS filesystem %s for namespace %s, proceeding with deletion", fileSystemId, namespace)
-
-	// First, delete all Access Points for this filesystem
-	if err := np.deleteAllAccessPointsForFileSystem(ctx, fileSystemId); err != nil {
-		klog.Warningf("Failed to delete some Access Points for EFS %s: %v", fileSystemId, err)
-		// Continue with deletion as Access Points might be orphaned
-	}
-
-	// Delete all mount targets
-	if err := np.deleteAllMountTargetsForFileSystem(ctx, fileSystemId); err != nil {
-		return fmt.Errorf("failed to delete mount targets for EFS %s: %w", fileSystemId, err)
-	}
-
-	// Wait for mount targets to be deleted
-	if err := np.waitForMountTargetsDeletion(ctx, fileSystemId); err != nil {
-		return fmt.Errorf("timeout waiting for mount targets deletion for EFS %s: %w", fileSystemId, err)
-	}
-
-	// Finally, delete the EFS filesystem
-	klog.V(2).Infof("Deleting EFS filesystem %s for namespace %s", fileSystemId, namespace)
-	if err := np.cloud.DeleteFileSystem(ctx, fileSystemId); err != nil {
-		return fmt.Errorf("failed to delete EFS filesystem %s: %w", fileSystemId, err)
-	}
-
-	// Remove from cache
-	np.removeCachedEFS(namespace)
-
-	// Remove mapping
-	if err := np.mapper.DeleteMapping(ctx, namespace); err != nil {
-		klog.Warningf("Failed to delete namespace mapping for %s: %v", namespace, err)
-		// Don't fail the operation for this
-	}
-
-	// Record metrics
-	np.metricsCollector.IncEFSDeleted(namespace)
-
-	klog.V(2).Infof("Successfully deleted EFS filesystem %s for namespace %s", fileSystemId, namespace)
+	// This implementation would be added later as part of the cleanup logic
+	// For now, we'll just log and return nil (retain policy)
+	klog.V(2).Infof("Delete EFS for namespace %s requested - using retain policy", namespace)
 	return nil
-}
-
-// deleteAllAccessPointsForFileSystem deletes all Access Points for a given EFS filesystem
-func (np *NamespaceProvisioner) deleteAllAccessPointsForFileSystem(ctx context.Context, fileSystemId string) error {
-	klog.V(2).Infof("Deleting all Access Points for EFS filesystem: %s", fileSystemId)
-
-	// List all Access Points for this filesystem
-	accessPoints, err := np.cloud.ListAccessPoints(ctx, fileSystemId)
-	if err != nil {
-		return fmt.Errorf("failed to list Access Points for EFS %s: %w", fileSystemId, err)
-	}
-
-	// Delete each Access Point
-	for _, ap := range accessPoints {
-		klog.V(2).Infof("Deleting Access Point: %s", ap.AccessPointId)
-		if err := np.cloud.DeleteAccessPoint(ctx, ap.AccessPointId); err != nil {
-			klog.Warningf("Failed to delete Access Point %s: %v", ap.AccessPointId, err)
-			// Continue with other Access Points
-		}
-	}
-
-	// Wait for all Access Points to be deleted
-	for _, ap := range accessPoints {
-		if err := np.waitForAccessPointDeletion(ctx, ap.AccessPointId); err != nil {
-			klog.Warningf("Timeout waiting for Access Point %s deletion: %v", ap.AccessPointId, err)
-			// Continue anyway
-		}
-	}
-
-	klog.V(2).Infof("Completed deletion of %d Access Points for EFS %s", len(accessPoints), fileSystemId)
-	return nil
-}
-
-// deleteAllMountTargetsForFileSystem deletes all mount targets for a given EFS filesystem
-func (np *NamespaceProvisioner) deleteAllMountTargetsForFileSystem(ctx context.Context, fileSystemId string) error {
-	klog.V(2).Infof("Deleting all mount targets for EFS filesystem: %s", fileSystemId)
-
-	// List all mount targets for this filesystem
-	mountTargets, err := np.cloud.ListMountTargets(ctx, fileSystemId)
-	if err != nil {
-		return fmt.Errorf("failed to list mount targets for EFS %s: %w", fileSystemId, err)
-	}
-
-	// Delete each mount target
-	for _, mt := range mountTargets {
-		klog.V(2).Infof("Deleting mount target: %s", mt.MountTargetId)
-		if err := np.cloud.DeleteMountTarget(ctx, mt.MountTargetId); err != nil {
-			return fmt.Errorf("failed to delete mount target %s: %w", mt.MountTargetId, err)
-		}
-	}
-
-	klog.V(2).Infof("Completed deletion of %d mount targets for EFS %s", len(mountTargets), fileSystemId)
-	return nil
-}
-
-// waitForMountTargetsDeletion waits for all mount targets to be deleted
-func (np *NamespaceProvisioner) waitForMountTargetsDeletion(ctx context.Context, fileSystemId string) error {
-	klog.V(2).Infof("Waiting for mount targets deletion for EFS: %s", fileSystemId)
-
-	timeout := 5 * time.Minute
-	checkInterval := 10 * time.Second
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for mount targets deletion for EFS %s", fileSystemId)
-		case <-ticker.C:
-			mountTargets, err := np.cloud.ListMountTargets(ctx, fileSystemId)
-			if err != nil {
-				// Check if the filesystem itself was deleted
-				if err == cloud.ErrNotFound {
-					klog.V(2).Infof("EFS filesystem %s not found, assuming mount targets are deleted", fileSystemId)
-					return nil
-				}
-				klog.Warningf("Error checking mount targets for EFS %s: %v", fileSystemId, err)
-				continue
-			}
-
-			if len(mountTargets) == 0 {
-				klog.V(2).Infof("All mount targets deleted for EFS: %s", fileSystemId)
-				return nil
-			}
-
-			klog.V(4).Infof("Still waiting for %d mount targets to be deleted for EFS %s", len(mountTargets), fileSystemId)
-		}
-	}
-}
-
-// waitForAccessPointDeletion waits for a specific Access Point to be deleted
-func (np *NamespaceProvisioner) waitForAccessPointDeletion(ctx context.Context, accessPointId string) error {
-	timeout := 2 * time.Minute
-	checkInterval := 5 * time.Second
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timeout waiting for Access Point %s deletion", accessPointId)
-		case <-ticker.C:
-			_, err := np.cloud.DescribeAccessPoint(ctx, accessPointId)
-			if err == cloud.ErrNotFound {
-				return nil // Access Point is deleted
-			}
-			if err != nil {
-				klog.Warningf("Error checking Access Point %s: %v", accessPointId, err)
-				continue
-			}
-			// Access Point still exists, continue waiting
-		}
-	}
 }
 
 // DeleteNamespaceVolume implements the namespace-level EFS volume deletion logic
@@ -1991,9 +1462,8 @@ func (np *NamespaceProvisioner) CreateAccessPointForPVC(ctx context.Context, pvc
 	// Generate client token for idempotency
 	clientToken := fmt.Sprintf("ap-%s-%s-%d", namespace, pvcName, time.Now().UnixNano())
 
-	// Create the cloud Access Point options with PVC name as Name tag
+	// Create the cloud Access Point options
 	cloudOptions := &cloud.AccessPointOptions{
-		Name:           pvcName, // Set Access Point Name to PVC name
 		FileSystemId:   options.FileSystemId,
 		DirectoryPath:  accessPointPath,
 		DirectoryPerms: directoryPerms,
@@ -2005,36 +1475,6 @@ func (np *NamespaceProvisioner) CreateAccessPointForPVC(ctx context.Context, pvc
 
 	klog.V(2).Infof("Creating Access Point with path %s, uid=%d, gid=%d, perms=%s",
 		accessPointPath, uid, gid, directoryPerms)
-
-	// Wait for EFS filesystem and mount targets to be available before creating Access Point
-	klog.V(2).Infof("Waiting for EFS filesystem %s to be fully available before creating Access Point", options.FileSystemId)
-
-	// Check if this is a cross-account scenario
-	// In cross-account scenarios, we may not be able to describe the filesystem
-	// Skip waiting if we get permission errors
-	if err := np.cloud.WaitForFileSystemAvailable(ctx, options.FileSystemId); err != nil {
-		// If it's a not found error, it might be cross-account
-		// Check both the error type and the error message
-		if errors.Is(err, cloud.ErrNotFound) || strings.Contains(err.Error(), "Resource was not found") || strings.Contains(err.Error(), "failed to describe filesystem") {
-			klog.Warningf("Cannot describe filesystem %s - might be cross-account, skipping wait: %v", options.FileSystemId, err)
-			// Continue without waiting - the filesystem was created successfully
-		} else {
-			return nil, fmt.Errorf("failed to wait for EFS filesystem %s to be available: %w", options.FileSystemId, err)
-		}
-	}
-
-	// Wait for mount targets to be available
-	// Skip for cross-account scenarios where we can't describe
-	if err := np.cloud.WaitForMountTargetsAvailable(ctx, options.FileSystemId); err != nil {
-		if errors.Is(err, cloud.ErrNotFound) || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "failed to list mount targets") {
-			klog.Warningf("Cannot describe mount targets for %s - might be cross-account, skipping wait: %v", options.FileSystemId, err)
-			// Continue without waiting
-		} else {
-			return nil, fmt.Errorf("failed to wait for mount targets of EFS filesystem %s to be available: %w", options.FileSystemId, err)
-		}
-	}
-
-	klog.V(2).Infof("EFS filesystem %s and its mount targets are fully available for Access Point creation", options.FileSystemId)
 
 	// Create the Access Point via cloud provider with retry logic
 	strategy := retry.EFSProvisioningStrategy()
@@ -2131,40 +1571,39 @@ func (np *NamespaceProvisioner) DeleteAccessPointForPVC(ctx context.Context, pvc
 
 // buildAccessPointPath constructs the directory path for an Access Point
 func (np *NamespaceProvisioner) buildAccessPointPath(pvcName, namespace string, options *cloud.AccessPointOptions) (string, error) {
-	// Simple path: /namespace/pvcname-shortid
-	// AWS EFS constraints: max 100 chars, max 4 segments
-	
-	// Create short unique ID (8 chars)
-	uniqueId := uuid.New().String()[:8]
-	
-	// Truncate namespace and PVC names if needed
-	ns := namespace
-	if len(namespace) > 30 {
-		ns = namespace[:30]
+	// Use base path from options or default
+	basePath := DefaultBasePath
+	if options.DirectoryPath != "" {
+		// If DirectoryPath is already set in options, use it directly
+		basePath = options.DirectoryPath
 	}
-	
-	pvc := pvcName  
-	if len(pvcName) > 30 {
-		pvc = pvcName[:30]
+
+	// Apply subPath pattern if specified
+	// For now, we'll use PVC name as subPath pattern
+	subPath := pvcName
+
+	// Ensure unique directory if requested
+	// UUID ensures uniqueness across the entire cluster
+	uniqueId := uuid.New().String()
+
+	// Build the full path
+	var fullPath string
+	if strings.Contains(subPath, "${.PV.name}") || strings.Contains(subPath, "${.PVC.name}") {
+		// Handle template patterns
+		subPath = strings.ReplaceAll(subPath, "${.PVC.name}", pvcName)
+		subPath = strings.ReplaceAll(subPath, "${.PV.name}", pvcName) // For compatibility
+		fullPath = filepath.Join(basePath, subPath, uniqueId)
+	} else {
+		// Simple path construction
+		fullPath = filepath.Join(basePath, namespace, subPath, uniqueId)
 	}
-	
-	// Simple 2-segment path: /namespace/pvcname-id
-	fullPath := fmt.Sprintf("/%s/%s-%s", ns, pvc, uniqueId)
-	
-	// Validate constraints
-	if len(fullPath) > 100 {
-		// Further truncate if needed
-		maxPvcLen := 100 - len(ns) - len(uniqueId) - 3 // account for slashes and dash
-		if maxPvcLen > 0 && maxPvcLen < len(pvc) {
-			pvc = pvc[:maxPvcLen]
-		}
-		fullPath = fmt.Sprintf("/%s/%s-%s", ns, pvc, uniqueId)
-	}
-	
+
+	// Ensure path starts with / and is clean
+	fullPath = filepath.Clean("/" + strings.TrimPrefix(fullPath, "/"))
+
 	klog.V(4).Infof("Built Access Point path: %s for PVC %s in namespace %s", fullPath, pvcName, namespace)
 	return fullPath, nil
 }
-
 
 // determinePosixIDs determines the UID and GID to use for the Access Point
 func (np *NamespaceProvisioner) determinePosixIDs(options *cloud.AccessPointOptions) (uid, gid int64, err error) {
@@ -2349,8 +1788,7 @@ func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *
 	volSize := req.GetCapacityRange().GetRequiredBytes()
 
 	// Create the volume response
-	// Format: filesystem::accesspoint for proper parsing by node driver
-	volumeId := fmt.Sprintf("%s::%s", fileSystem.FileSystemId, accessPoint.AccessPointId)
+	volumeId := accessPoint.AccessPointId
 	volumeContext := map[string]string{
 		"accesspoint": accessPoint.AccessPointId,
 		"filesystem":  fileSystem.FileSystemId,
