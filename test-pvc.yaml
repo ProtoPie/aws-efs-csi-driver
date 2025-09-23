@@ -25,7 +25,20 @@ volumeBindingMode: Immediate
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: efs-ns-test
+  name: efs-ns-test-1
+  namespace: efs-ns-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-test
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-ns-test-2
   namespace: efs-ns-test
 spec:
   accessModes:
@@ -55,8 +68,10 @@ spec:
         sleep 300
       done
     volumeMounts:
-    - name: efs-storage
-      mountPath: /mnt/efs
+    - name: efs-storage-1
+      mountPath: /mnt/efs-1
+    - name: efs-storage-2
+      mountPath: /mnt/efs-2
     resources:
       requests:
         memory: "64Mi"
@@ -65,7 +80,10 @@ spec:
         memory: "128Mi"
         cpu: "100m"
   volumes:
-  - name: efs-storage
+  - name: efs-storage-1
     persistentVolumeClaim:
-      claimName: efs-ns-test
+      claimName: efs-ns-test-1
+  - name: efs-storage-2
+    persistentVolumeClaim:
+      claimName: efs-ns-test-2
   restartPolicy: Always
