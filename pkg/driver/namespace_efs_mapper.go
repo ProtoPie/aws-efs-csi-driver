@@ -207,9 +207,11 @@ func (m *NamespaceEFSMapper) CreateOrUpdateMapping(ctx context.Context, namespac
 		"region", region)
 
 	// Create or update the CRD resource
+	// For namespaced CRDs, the resource is created in the same namespace it represents
 	efsNamespace := &efsv1alpha1.EFSNamespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: namespace, // CRD name matches namespace name
+			Name:      "efs-mapping", // Use a fixed name for the mapping within each namespace
+			Namespace: namespace,      // Set the namespace for the CRD resource
 		},
 		Spec: efsv1alpha1.EFSNamespaceSpec{
 			Namespace:     namespace,
@@ -223,17 +225,36 @@ func (m *NamespaceEFSMapper) CreateOrUpdateMapping(ctx context.Context, namespac
 	var err error
 
 	// Try to get existing resource first
-	existing, getErr := m.crdClient.Get(ctx, namespace, metav1.GetOptions{})
+	// For namespaced resources, we need to specify the namespace
+	existing, getErr := m.crdClient.Namespace(namespace).Get(ctx, "efs-mapping", metav1.GetOptions{})
 	if getErr != nil && !errors.IsNotFound(getErr) {
 		return nil, fmt.Errorf("failed to check existing EFSNamespace: %w", getErr)
 	}
 
 	if errors.IsNotFound(getErr) {
+		// Set initial status
+		efsNamespace.Status = efsv1alpha1.EFSNamespaceStatus{
+			State:         "Provisioning",
+			FileSystemID:  fileSystemID,
+			FileSystemArn: fileSystemArn,
+			LastUpdated:   &metav1.Time{Time: time.Now()},
+			Message:       "EFS filesystem mapped to namespace",
+		}
+
 		// Create new resource
-		result, err = m.crdClient.Create(ctx, efsNamespace, metav1.CreateOptions{})
+		result, err = m.crdClient.Namespace(namespace).Create(ctx, efsNamespace, metav1.CreateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to create EFSNamespace CRD: %w", err)
 		}
+
+		// Update status separately (CRDs require separate status updates)
+		result.Status = efsNamespace.Status
+		result, err = m.crdClient.Namespace(namespace).UpdateStatus(ctx, result, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Warningf("Failed to update EFSNamespace status: %v", err)
+			// Don't fail the operation, status update is not critical
+		}
+
 		klog.V(2).InfoS("Created new EFSNamespace CRD", "namespace", namespace, "fileSystemID", fileSystemID)
 	} else {
 		// Update existing resource
@@ -241,10 +262,25 @@ func (m *NamespaceEFSMapper) CreateOrUpdateMapping(ctx context.Context, namespac
 		existing.Spec.FileSystemArn = fileSystemArn
 		existing.Spec.Region = region
 
-		result, err = m.crdClient.Update(ctx, existing, metav1.UpdateOptions{})
+		result, err = m.crdClient.Namespace(namespace).Update(ctx, existing, metav1.UpdateOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to update EFSNamespace CRD: %w", err)
 		}
+
+		// Update status
+		existing.Status.State = "Active"
+		existing.Status.FileSystemID = fileSystemID
+		existing.Status.FileSystemArn = fileSystemArn
+		existing.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+		existing.Status.Message = "EFS filesystem successfully mapped"
+		existing.Status.ObservedGeneration = result.Generation
+
+		result, err = m.crdClient.Namespace(namespace).UpdateStatus(ctx, existing, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Warningf("Failed to update EFSNamespace status: %v", err)
+			// Don't fail the operation, status update is not critical
+		}
+
 		klog.V(2).InfoS("Updated existing EFSNamespace CRD", "namespace", namespace, "fileSystemID", fileSystemID)
 	}
 
@@ -282,7 +318,7 @@ func (m *NamespaceEFSMapper) GetMapping(ctx context.Context, namespace string) (
 	}
 
 	// Fallback to CRD if not in cache
-	efsNamespace, err := m.crdClient.Get(ctx, namespace, metav1.GetOptions{})
+	efsNamespace, err := m.crdClient.Namespace(namespace).Get(ctx, "efs-mapping", metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
 			klog.V(4).InfoS("No EFS mapping found for namespace", "namespace", namespace)
@@ -317,7 +353,7 @@ func (m *NamespaceEFSMapper) DeleteMapping(ctx context.Context, namespace string
 	klog.V(2).InfoS("Deleting namespace EFS mapping", "namespace", namespace)
 
 	// Delete from CRD
-	err := m.crdClient.Delete(ctx, namespace, metav1.DeleteOptions{})
+	err := m.crdClient.Namespace(namespace).Delete(ctx, "efs-mapping", metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete EFSNamespace CRD: %w", err)
 	}
@@ -333,8 +369,9 @@ func (m *NamespaceEFSMapper) DeleteMapping(ctx context.Context, namespace string
 func (m *NamespaceEFSMapper) ListMappings(ctx context.Context) ([]NamespaceEFSMapping, error) {
 	klog.V(4).InfoS("Listing all namespace EFS mappings")
 
-	// Get all EFSNamespace CRDs
-	efsNamespaceList, err := m.crdClient.List(ctx, metav1.ListOptions{})
+	// For namespaced CRDs, we need to list across all namespaces
+	// Use empty string for namespace to list across all namespaces
+	efsNamespaceList, err := m.crdClient.Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list EFSNamespace CRDs: %w", err)
 	}

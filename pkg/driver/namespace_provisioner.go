@@ -50,6 +50,8 @@ const (
 
 	// EFS CSI Driver finalizer for namespace cleanup
 	EFSNamespaceFinalizer = "efs.csi.aws.com/namespace-cleanup"
+	// EFS CSI Driver finalizer for PV cleanup - ensures access point deletion
+	EFSPVFinalizer = "efs.csi.aws.com/pv-cleanup"
 
 	// Default configuration values
 	DefaultCacheTimeout     = 5 * time.Minute
@@ -246,6 +248,10 @@ type NamespaceProvisioner struct {
 	nsWatcher    watch.Interface
 	nsStopCh     chan struct{}
 	startMutex sync.Mutex
+
+	// PV deletion monitoring
+	pvWatcher    watch.Interface
+	pvStopCh     chan struct{}
 
 	// Metrics and monitoring
 	metricsCollector MetricsCollector
@@ -454,6 +460,28 @@ func (np *NamespaceProvisioner) Start(ctx context.Context) error {
 	// Start namespace watcher for automatic EFS cleanup
 	if err := np.startNamespaceWatcher(ctx); err != nil {
 		klog.Errorf("Failed to start namespace watcher: %v", err)
+		// Don't fail the entire start process, but retry in background
+		go func() {
+			retryInterval := 30 * time.Second
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(retryInterval):
+					klog.V(2).Info("Retrying namespace watcher start...")
+					if err := np.startNamespaceWatcher(ctx); err == nil {
+						klog.V(2).Info("Successfully started namespace watcher after retry")
+						return
+					}
+					klog.Errorf("Failed to restart namespace watcher: %v", err)
+				}
+			}
+		}()
+	}
+
+	// Start PV watcher for automatic Access Point cleanup
+	if err := np.startPVWatcher(ctx); err != nil {
+		klog.Errorf("Failed to start PV watcher: %v", err)
 		// Don't fail the entire start process, but log the error
 	}
 
@@ -496,6 +524,14 @@ func (np *NamespaceProvisioner) Stop() error {
 	}
 	if np.nsWatcher != nil {
 		np.nsWatcher.Stop()
+	}
+
+	// Stop PV watcher
+	if np.pvStopCh != nil {
+		close(np.pvStopCh)
+	}
+	if np.pvWatcher != nil {
+		np.pvWatcher.Stop()
 	}
 
 	// Wait for all goroutines to finish
@@ -819,11 +855,254 @@ func (np *NamespaceProvisioner) hasEFSFinalizer(ns *corev1.Namespace) bool {
 	return false
 }
 
+// startPVWatcher starts monitoring PersistentVolumes for deletion events
+func (np *NamespaceProvisioner) startPVWatcher(ctx context.Context) error {
+	klog.V(2).Infof("Starting PV watcher for EFS access point cleanup")
+
+	// Create stop channel for this watcher
+	np.pvStopCh = make(chan struct{})
+
+	// Start watching PVs
+	var err error
+	np.pvWatcher, err = np.k8sClient.CoreV1().PersistentVolumes().Watch(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to start PV watcher: %w", err)
+	}
+
+	// Start the watcher goroutine
+	np.wg.Add(1)
+	go func() {
+		defer np.wg.Done()
+		defer func() {
+			if np.pvWatcher != nil {
+				np.pvWatcher.Stop()
+			}
+		}()
+
+		for {
+			select {
+			case <-np.pvStopCh:
+				klog.V(2).Infof("PV watcher stopping")
+				return
+
+			case event, ok := <-np.pvWatcher.ResultChan():
+				if !ok {
+					klog.Warningf("PV watcher channel closed, attempting to restart")
+					if err := np.restartPVWatcher(ctx); err != nil {
+						klog.Errorf("Failed to restart PV watcher: %v", err)
+						return
+					}
+					continue
+				}
+
+				if event.Type == watch.Modified || event.Type == watch.Deleted {
+					pv, ok := event.Object.(*corev1.PersistentVolume)
+					if !ok {
+						klog.Warningf("Unexpected object type in PV watch: %T", event.Object)
+						continue
+					}
+
+					// Only handle PVs that are:
+					// 1. Using our EFS CSI driver
+					// 2. In namespace provisioning mode (efs-ns)
+					// 3. Have Delete reclaim policy
+					if np.isEFSNamespaceProvisionedPV(pv) {
+						if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
+							// Check if PV is being deleted and has our finalizer
+							if pv.DeletionTimestamp != nil && np.hasEFSPVFinalizer(pv) {
+								klog.V(2).Infof("Detected PV deletion with EFS finalizer: %s", pv.Name)
+								go np.handlePVDeletion(ctx, pv)
+							} else if event.Type == watch.Modified && pv.DeletionTimestamp == nil {
+								// For newly created PVs, add finalizer if they don't have it
+								if !np.hasEFSPVFinalizer(pv) {
+									go np.addPVFinalizer(ctx, pv.Name)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// restartPVWatcher restarts the PV watcher after a failure
+func (np *NamespaceProvisioner) restartPVWatcher(ctx context.Context) error {
+	if np.pvWatcher != nil {
+		np.pvWatcher.Stop()
+	}
+
+	// Wait a bit before restarting
+	time.Sleep(5 * time.Second)
+
+	return np.startPVWatcher(ctx)
+}
+
+// isEFSNamespaceProvisionedPV checks if a PV is provisioned by EFS CSI driver in namespace mode
+func (np *NamespaceProvisioner) isEFSNamespaceProvisionedPV(pv *corev1.PersistentVolume) bool {
+	if pv.Spec.CSI == nil {
+		return false
+	}
+
+	// Check if it's our EFS CSI driver
+	if pv.Spec.CSI.Driver != driverName {
+		return false
+	}
+
+	// Check if it's namespace provisioning mode
+	if provisioningMode, ok := pv.Spec.CSI.VolumeAttributes["provisioningMode"]; ok {
+		return provisioningMode == NamespaceProvisioningMode
+	}
+
+	// Also check if the volume handle contains an access point ID
+	// In efs-ns mode, volume handle format is "filesystem::accesspoint"
+	volumeHandle := pv.Spec.CSI.VolumeHandle
+	if strings.Contains(volumeHandle, "::") {
+		parts := strings.Split(volumeHandle, "::")
+		if len(parts) == 2 && strings.HasPrefix(parts[1], "fsap-") {
+			return true
+		}
+	}
+	// For backward compatibility, also check if volumeHandle is just an access point ID
+	return strings.HasPrefix(volumeHandle, "fsap-") && !strings.Contains(volumeHandle, "::")
+}
+
+// hasEFSPVFinalizer checks if a PV has the EFS PV finalizer
+func (np *NamespaceProvisioner) hasEFSPVFinalizer(pv *corev1.PersistentVolume) bool {
+	for _, finalizer := range pv.Finalizers {
+		if finalizer == EFSPVFinalizer {
+			return true
+		}
+	}
+	return false
+}
+
+// addPVFinalizer adds the EFS PV finalizer to a PersistentVolume
+func (np *NamespaceProvisioner) addPVFinalizer(ctx context.Context, pvName string) error {
+	pv, err := np.k8sClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get PV %s: %w", pvName, err)
+	}
+
+	// Check if finalizer already exists
+	if np.hasEFSPVFinalizer(pv) {
+		return nil // Already has the finalizer
+	}
+
+	// Add the finalizer
+	pv.Finalizers = append(pv.Finalizers, EFSPVFinalizer)
+
+	_, err = np.k8sClient.CoreV1().PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to add finalizer to PV %s: %w", pvName, err)
+	}
+
+	klog.V(2).Infof("Added EFS PV finalizer to PV %s", pvName)
+	return nil
+}
+
+// removePVFinalizer removes the EFS PV finalizer from a PersistentVolume
+func (np *NamespaceProvisioner) removePVFinalizer(ctx context.Context, pvName string) error {
+	pv, err := np.k8sClient.CoreV1().PersistentVolumes().Get(ctx, pvName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get PV %s: %w", pvName, err)
+	}
+
+	// Remove the finalizer
+	var updatedFinalizers []string
+	for _, finalizer := range pv.Finalizers {
+		if finalizer != EFSPVFinalizer {
+			updatedFinalizers = append(updatedFinalizers, finalizer)
+		}
+	}
+
+	pv.Finalizers = updatedFinalizers
+
+	_, err = np.k8sClient.CoreV1().PersistentVolumes().Update(ctx, pv, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to remove finalizer from PV %s: %w", pvName, err)
+	}
+
+	klog.V(2).Infof("Removed EFS PV finalizer from PV %s", pvName)
+	return nil
+}
+
+// handlePVDeletion handles the cleanup when a PV with EFS finalizer is being deleted
+func (np *NamespaceProvisioner) handlePVDeletion(ctx context.Context, pv *corev1.PersistentVolume) {
+	pvName := pv.Name
+	klog.V(2).Infof("Starting EFS access point cleanup for PV deletion: %s", pvName)
+
+	// Extract the access point ID from the volume handle
+	volumeHandle := pv.Spec.CSI.VolumeHandle
+	if volumeHandle == "" {
+		klog.Errorf("PV %s has no volume handle", pvName)
+		// Remove finalizer anyway to not block PV deletion
+		if err := np.removePVFinalizer(ctx, pvName); err != nil {
+			klog.Errorf("Failed to remove finalizer from PV %s: %v", pvName, err)
+		}
+		return
+	}
+
+	// Parse the volume handle to extract access point ID
+	// In efs-ns mode, format is "filesystem::accesspoint"
+	var accessPointId string
+	if strings.Contains(volumeHandle, "::") {
+		parts := strings.Split(volumeHandle, "::")
+		if len(parts) == 2 {
+			accessPointId = parts[1]
+		}
+	} else {
+		// For backward compatibility, handle cases where volumeHandle is just the access point ID
+		accessPointId = volumeHandle
+	}
+
+	if accessPointId == "" || !strings.HasPrefix(accessPointId, "fsap-") {
+		klog.Errorf("PV %s has invalid access point ID in volume handle: %s", pvName, volumeHandle)
+		// Remove finalizer anyway to not block PV deletion
+		if err := np.removePVFinalizer(ctx, pvName); err != nil {
+			klog.Errorf("Failed to remove finalizer from PV %s: %v", pvName, err)
+		}
+		return
+	}
+
+	// Create a cleanup context with timeout
+	cleanupCtx, cancel := context.WithTimeout(ctx, np.options.CleanupTimeout)
+	defer cancel()
+
+	// Delete the access point
+	klog.V(2).Infof("Deleting access point %s for PV %s", accessPointId, pvName)
+	if err := np.cloud.DeleteAccessPoint(cleanupCtx, accessPointId); err != nil {
+		if err == cloud.ErrNotFound {
+			klog.V(2).Infof("Access point %s not found - assuming already deleted", accessPointId)
+		} else {
+			klog.Errorf("Failed to delete access point %s for PV %s: %v", accessPointId, pvName, err)
+			// Don't remove finalizer if cleanup failed - will retry on next reconciliation
+			return
+		}
+	} else {
+		klog.V(2).Infof("Successfully deleted access point %s for PV %s", accessPointId, pvName)
+	}
+
+	// Remove the finalizer to allow PV deletion to proceed
+	if err := np.removePVFinalizer(cleanupCtx, pvName); err != nil {
+		klog.Errorf("Failed to remove finalizer from PV %s: %v", pvName, err)
+	} else {
+		klog.V(2).Infof("Successfully cleaned up EFS access point and removed finalizer for PV: %s", pvName)
+	}
+}
+
 // hasActivePVsInNamespace checks if there are any active PVCs in the namespace that would use EFS resources
 func (np *NamespaceProvisioner) hasActivePVsInNamespace(ctx context.Context, namespace string) (bool, error) {
 	// List all PVCs in the namespace (including those being deleted)
 	pvcList, err := np.k8sClient.CoreV1().PersistentVolumeClaims(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		// If namespace is not found, it's safe to say there are no PVCs
+		if apierrors.IsNotFound(err) {
+			klog.V(3).Infof("Namespace %s not found when checking PVCs, assuming no active PVs", namespace)
+			return false, nil
+		}
 		return false, fmt.Errorf("failed to list PVCs in namespace %s: %w", namespace, err)
 	}
 
@@ -898,34 +1177,87 @@ func (np *NamespaceProvisioner) handleNamespaceDeletion(ctx context.Context, nam
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), np.options.CleanupTimeout)
 	defer cancel()
 
-	// Check if there are any PVs still claiming resources in this namespace
-	hasActivePVs, err := np.hasActivePVsInNamespace(cleanupCtx, namespace)
-	if err != nil {
-		klog.Errorf("Failed to check active PVs for namespace %s: %v", namespace, err)
-		// Don't proceed with cleanup if we can't verify PV status
-		return
-	}
+	// Retry logic for handling transient failures
+	retryCount := 0
+	maxRetries := 3
+	retryDelay := 5 * time.Second
 
-	if hasActivePVs {
-		klog.V(2).Infof("Namespace %s still has active PVs, skipping EFS deletion. Finalizer will remain until all PVs are deleted.", namespace)
-		// Keep the finalizer - don't delete EFS yet
-		return
-	}
+	for retryCount < maxRetries {
+		// Check if there are any PVs still claiming resources in this namespace
+		hasActivePVs, err := np.hasActivePVsInNamespace(cleanupCtx, namespace)
+		if err != nil {
+			klog.Errorf("Failed to check active PVs for namespace %s (attempt %d/%d): %v", namespace, retryCount+1, maxRetries, err)
 
-	klog.V(2).Infof("No active PVs found in namespace %s, proceeding with EFS cleanup", namespace)
+			// If we're in the last retry and still failing, force cleanup
+			if retryCount == maxRetries-1 {
+				klog.Warningf("Unable to verify PV status after %d attempts, forcing namespace cleanup for %s", maxRetries, namespace)
+				// Try to check if namespace is really terminating
+				ns, nsErr := np.k8sClient.CoreV1().Namespaces().Get(cleanupCtx, namespace, metav1.GetOptions{})
+				if nsErr != nil && apierrors.IsNotFound(nsErr) {
+					klog.V(2).Infof("Namespace %s no longer exists, skipping cleanup", namespace)
+					return
+				}
+				if ns != nil && ns.DeletionTimestamp == nil {
+					klog.V(2).Infof("Namespace %s is not being deleted, skipping cleanup", namespace)
+					return
+				}
+				// Force cleanup since namespace is terminating but we can't verify PVs
+				hasActivePVs = false
+			} else {
+				retryCount++
+				time.Sleep(retryDelay)
+				continue
+			}
+		}
 
-	// Clean up EFS resources for the namespace
-	if err := np.DeleteNamespaceEFS(cleanupCtx, namespace); err != nil {
-		klog.Errorf("Failed to delete EFS for namespace %s: %v", namespace, err)
-		// Don't remove finalizer if cleanup failed
-		return
-	}
+		if hasActivePVs {
+			klog.V(2).Infof("Namespace %s still has active PVs, will retry cleanup later. Finalizer will remain until all PVs are deleted.", namespace)
+			// Schedule another check after some delay
+			go func() {
+				time.Sleep(30 * time.Second)
+				np.handleNamespaceDeletion(context.Background(), namespace)
+			}()
+			return
+		}
 
-	// Remove the finalizer to allow namespace deletion to proceed
-	if err := np.removeNamespaceFinalizer(cleanupCtx, namespace); err != nil {
-		klog.Errorf("Failed to remove finalizer from namespace %s: %v", namespace, err)
-	} else {
-		klog.V(2).Infof("Successfully cleaned up EFS and removed finalizer for namespace: %s", namespace)
+		klog.V(2).Infof("No active PVs found in namespace %s, proceeding with EFS cleanup", namespace)
+
+		// Clean up EFS resources for the namespace
+		if err := np.DeleteNamespaceEFS(cleanupCtx, namespace); err != nil {
+			if err == cloud.ErrNotFound {
+				klog.V(2).Infof("EFS not found for namespace %s, proceeding to remove finalizer", namespace)
+			} else {
+				klog.Errorf("Failed to delete EFS for namespace %s: %v", namespace, err)
+				// Retry cleanup if not the last attempt
+				if retryCount < maxRetries-1 {
+					retryCount++
+					time.Sleep(retryDelay)
+					continue
+				}
+				// On final failure, still try to remove finalizer if namespace is terminating
+				klog.Warningf("Failed to delete EFS after %d attempts, attempting to remove finalizer anyway for namespace %s", maxRetries, namespace)
+			}
+		}
+
+		// Remove the finalizer to allow namespace deletion to proceed
+		if err := np.removeNamespaceFinalizer(cleanupCtx, namespace); err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(2).Infof("Namespace %s no longer exists, cleanup complete", namespace)
+			} else {
+				klog.Errorf("Failed to remove finalizer from namespace %s: %v", namespace, err)
+				// Retry if not the last attempt
+				if retryCount < maxRetries-1 {
+					retryCount++
+					time.Sleep(retryDelay)
+					continue
+				}
+			}
+		} else {
+			klog.V(2).Infof("Successfully cleaned up EFS and removed finalizer for namespace: %s", namespace)
+		}
+
+		// Success - exit the retry loop
+		break
 	}
 }
 
@@ -2352,10 +2684,11 @@ func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *
 	// Format: filesystem::accesspoint for proper parsing by node driver
 	volumeId := fmt.Sprintf("%s::%s", fileSystem.FileSystemId, accessPoint.AccessPointId)
 	volumeContext := map[string]string{
-		"accesspoint": accessPoint.AccessPointId,
-		"filesystem":  fileSystem.FileSystemId,
-		"namespace":   namespace,
-		"pvcName":     pvcName,
+		"accesspoint":      accessPoint.AccessPointId,
+		"filesystem":       fileSystem.FileSystemId,
+		"namespace":        namespace,
+		"pvcName":          pvcName,
+		"provisioningMode": NamespaceProvisioningMode, // Mark as efs-ns mode for PV watcher
 	}
 
 	// Add any additional context from the original request

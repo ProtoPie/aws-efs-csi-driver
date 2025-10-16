@@ -85,6 +85,7 @@ helm upgrade --install "${RELEASE_NAME}" ./charts/aws-efs-csi-driver \
   --set controller.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${CONTROLLER_ROLE_ARN}" \
   --set node.serviceAccount.create=true \
   --set node.serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="${NODE_ROLE_ARN}" \
+  --set controller.efsNamespaceProvisioning.enabled=true \
   --wait --timeout 5m
 
 echo "✅ Deployment complete!"

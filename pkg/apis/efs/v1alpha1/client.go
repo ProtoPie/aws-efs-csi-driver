@@ -33,6 +33,7 @@ import (
 
 // EFSNamespaceInterface provides methods to work with EFSNamespace resources
 type EFSNamespaceInterface interface {
+	Namespace(namespace string) EFSNamespaceNamespaceInterface
 	Create(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.CreateOptions) (*EFSNamespace, error)
 	Update(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error)
 	UpdateStatus(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error)
@@ -43,9 +44,22 @@ type EFSNamespaceInterface interface {
 	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *EFSNamespace, err error)
 }
 
-// efsNamespaceClient implements EFSNamespaceInterface
-type efsNamespaceClient struct {
+// EFSNamespaceNamespaceInterface provides methods to work with namespaced EFSNamespace resources
+type EFSNamespaceNamespaceInterface interface {
+	Create(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.CreateOptions) (*EFSNamespace, error)
+	Update(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error)
+	UpdateStatus(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error)
+	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*EFSNamespace, error)
+	List(ctx context.Context, opts metav1.ListOptions) (*EFSNamespaceList, error)
+	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
+	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *EFSNamespace, err error)
+}
+
+// EFSNamespaceClient implements EFSNamespaceInterface
+type EFSNamespaceClient struct {
 	restClient rest.Interface
+	namespace  string
 }
 
 // NewEFSNamespaceClient creates a new client for EFSNamespace resources
@@ -65,16 +79,29 @@ func NewEFSNamespaceClient(config *rest.Config) (EFSNamespaceInterface, error) {
 		return nil, err
 	}
 
-	return &efsNamespaceClient{
+	return &EFSNamespaceClient{
 		restClient: client,
+		namespace:  "", // Empty namespace for cluster-wide operations
 	}, nil
 }
 
-func (c *efsNamespaceClient) Create(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.CreateOptions) (*EFSNamespace, error) {
+// Namespace returns a namespace-scoped client
+func (c *EFSNamespaceClient) Namespace(namespace string) EFSNamespaceNamespaceInterface {
+	return &EFSNamespaceClient{
+		restClient: c.restClient,
+		namespace:  namespace,
+	}
+}
+
+func (c *EFSNamespaceClient) Create(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.CreateOptions) (*EFSNamespace, error) {
 	result := &EFSNamespace{}
-	err := c.restClient.
-		Post().
-		Resource("efsnamespaces").
+	req := c.restClient.Post().Resource("efsnamespaces")
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Body(efsNamespace).
 		Do(ctx).
@@ -82,12 +109,15 @@ func (c *efsNamespaceClient) Create(ctx context.Context, efsNamespace *EFSNamesp
 	return result, err
 }
 
-func (c *efsNamespaceClient) Update(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error) {
+func (c *EFSNamespaceClient) Update(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error) {
 	result := &EFSNamespace{}
-	err := c.restClient.
-		Put().
-		Resource("efsnamespaces").
-		Name(efsNamespace.Name).
+	req := c.restClient.Put().Resource("efsnamespaces").Name(efsNamespace.Name)
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Body(efsNamespace).
 		Do(ctx).
@@ -95,13 +125,15 @@ func (c *efsNamespaceClient) Update(ctx context.Context, efsNamespace *EFSNamesp
 	return result, err
 }
 
-func (c *efsNamespaceClient) UpdateStatus(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error) {
+func (c *EFSNamespaceClient) UpdateStatus(ctx context.Context, efsNamespace *EFSNamespace, opts metav1.UpdateOptions) (*EFSNamespace, error) {
 	result := &EFSNamespace{}
-	err := c.restClient.
-		Put().
-		Resource("efsnamespaces").
-		Name(efsNamespace.Name).
-		SubResource("status").
+	req := c.restClient.Put().Resource("efsnamespaces").Name(efsNamespace.Name).SubResource("status")
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Body(efsNamespace).
 		Do(ctx).
@@ -109,55 +141,71 @@ func (c *efsNamespaceClient) UpdateStatus(ctx context.Context, efsNamespace *EFS
 	return result, err
 }
 
-func (c *efsNamespaceClient) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
-	return c.restClient.
-		Delete().
-		Resource("efsnamespaces").
-		Name(name).
+func (c *EFSNamespaceClient) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
+	req := c.restClient.Delete().Resource("efsnamespaces").Name(name)
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	return req.
 		Body(&opts).
 		Do(ctx).
 		Error()
 }
 
-func (c *efsNamespaceClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*EFSNamespace, error) {
+func (c *EFSNamespaceClient) Get(ctx context.Context, name string, opts metav1.GetOptions) (*EFSNamespace, error) {
 	result := &EFSNamespace{}
-	err := c.restClient.
-		Get().
-		Resource("efsnamespaces").
-		Name(name).
+	req := c.restClient.Get().Resource("efsnamespaces").Name(name)
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Do(ctx).
 		Into(result)
 	return result, err
 }
 
-func (c *efsNamespaceClient) List(ctx context.Context, opts metav1.ListOptions) (*EFSNamespaceList, error) {
+func (c *EFSNamespaceClient) List(ctx context.Context, opts metav1.ListOptions) (*EFSNamespaceList, error) {
 	result := &EFSNamespaceList{}
-	err := c.restClient.
-		Get().
-		Resource("efsnamespaces").
+	req := c.restClient.Get().Resource("efsnamespaces")
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Do(ctx).
 		Into(result)
 	return result, err
 }
 
-func (c *efsNamespaceClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+func (c *EFSNamespaceClient) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 	opts.Watch = true
-	return c.restClient.
-		Get().
-		Resource("efsnamespaces").
+	req := c.restClient.Get().Resource("efsnamespaces")
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	return req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Watch(ctx)
 }
 
-func (c *efsNamespaceClient) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*EFSNamespace, error) {
+func (c *EFSNamespaceClient) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (*EFSNamespace, error) {
 	result := &EFSNamespace{}
-	err := c.restClient.
-		Patch(pt).
-		Resource("efsnamespaces").
-		Name(name).
-		SubResource(subresources...).
+	req := c.restClient.Patch(pt).Resource("efsnamespaces").Name(name).SubResource(subresources...)
+
+	if c.namespace != "" {
+		req = req.Namespace(c.namespace)
+	}
+
+	err := req.
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Body(data).
 		Do(ctx).

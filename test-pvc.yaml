@@ -19,7 +19,7 @@ parameters:
   performanceThroughputMode: elastic
   provisioningMode: efs-ns
 provisioner: efs.csi.aws.com
-reclaimPolicy: Delete
+reclaimPolicy: Retain
 volumeBindingMode: Immediate
 ---
 apiVersion: v1

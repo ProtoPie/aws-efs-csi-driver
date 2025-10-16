@@ -1,0 +1,69 @@
+# Example values file for enabling EFS namespace provisioning feature
+# This enables automatic EFS filesystem mapping per namespace
+
+controller:
+  # Enable namespace-based EFS provisioning
+  efsNamespaceProvisioning:
+    enabled: true
+
+  # Additional settings for namespace provisioning
+  serviceAccount:
+    create: true
+    name: efs-csi-controller-sa
+    annotations:
+      # Add IAM role for cross-account access if needed
+      # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/EFSCSIControllerRole
+
+  # Resource limits for controller
+  resources:
+    limits:
+      memory: 256Mi
+    requests:
+      cpu: 10m
+      memory: 40Mi
+
+# Storage class configuration for namespace provisioning
+storageClasses:
+- name: efs-namespace-provisioned
+  annotations:
+    # This storage class uses namespace-based provisioning
+    storageclass.kubernetes.io/is-default-class: "false"
+  parameters:
+    provisioningMode: efs-ns
+    fileSystemId: "" # Leave empty for auto-provisioning per namespace
+    directoryPerms: "700"
+    gidRangeStart: "1000"
+    gidRangeEnd: "2000"
+    basePath: "/dynamic_provisioning"
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+
+# Node configuration
+node:
+  serviceAccount:
+    create: true
+    name: efs-csi-node-sa
+
+  # Tolerate all taints for node DaemonSet
+  tolerateAllTaints: true
+
+# Image configuration
+image:
+  repository: amazon/aws-efs-csi-driver
+  tag: "v2.1.0"
+  pullPolicy: IfNotPresent
+
+# Global settings
+replicaCount: 2
+
+# Log level for debugging
+logLevel: 2
+
+# AWS region (optional, will be auto-detected if not set)
+# region: us-west-2
+
+# Additional tags for created EFS resources
+tags:
+  Environment: production
+  ManagedBy: efs-csi-driver
+  ProvisioningMode: namespace-based
