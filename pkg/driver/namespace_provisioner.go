@@ -40,6 +40,9 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/retry"
 )
@@ -353,20 +356,12 @@ func NewNamespaceProvisioner(cloud cloud.Cloud, k8sClient kubernetes.Interface, 
 	// Initialize volume status tracker
 	statusTracker := NewVolumeStatusTracker(nil, k8sClient) // EventRecorder will be set later
 
-	// Extract account ID from metadata or environment
-	accountID := ""
-	if roleArn := os.Getenv("AWS_ROLE_ARN"); roleArn != "" {
-		// Extract account ID from role ARN: arn:aws:iam::ACCOUNT_ID:role/...
-		parts := strings.Split(roleArn, ":")
-		if len(parts) >= 5 {
-			accountID = parts[4]
-		}
+	// Extract account ID from STS or environment
+	accountID, err := getAWSAccountID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to determine AWS account ID: %w", err)
 	}
-	if accountID == "" {
-		// Default to the account ID we know is being used
-		accountID = "310455165573"
-		klog.Warningf("Could not determine AWS account ID from environment, using default: %s", accountID)
-	}
+	klog.V(2).Infof("Using AWS account ID: %s", accountID)
 
 	provisioner := &NamespaceProvisioner{
 		cloud:       cloud,
@@ -1976,13 +1971,30 @@ func (np *NamespaceProvisioner) DeleteNamespaceVolume(ctx context.Context, req *
 
 	volumeId := req.GetVolumeId()
 	if volumeId == "" {
-		return nil, fmt.Errorf("volume ID cannot be empty")
+		// CSI spec: invalid volume ID should return success
+		klog.V(5).Infof("DeleteNamespaceVolume: Empty volume ID, returning success per CSI spec")
+		return &csi.DeleteVolumeResponse{}, nil
 	}
 
-	// In namespace provisioning mode, the volumeId is the Access Point ID
-	accessPointId := volumeId
+	// Parse volumeId which is in format: fs-xxx::fsap-xxx (same as efs-ap mode)
+	var accessPointId string
+	if strings.Contains(volumeId, "::") {
+		parts := strings.Split(volumeId, "::")
+		if len(parts) == 2 {
+			accessPointId = parts[1]
+		}
+	} else {
+		// Backward compatibility: bare access point ID
+		accessPointId = volumeId
+	}
 
-	klog.V(2).Infof("Deleting namespace volume with Access Point ID: %s", accessPointId)
+	if accessPointId == "" || !strings.HasPrefix(accessPointId, "fsap-") {
+		// Invalid volume ID format - not an efs-ns volume, delegate to efs-ap logic
+		klog.V(5).Infof("DeleteNamespaceVolume: Invalid or non-efs-ns volume ID format: %s - delegating to efs-ap logic", volumeId)
+		return nil, nil
+	}
+
+	klog.V(2).Infof("DeleteNamespaceVolume: Attempting to delete volume %s (Access Point ID: %s)", volumeId, accessPointId)
 
 	// Get Access Point details first to extract namespace and PVC information for status tracking
 	accessPoint, err := np.cloud.DescribeAccessPoint(ctx, accessPointId)
@@ -1991,18 +2003,26 @@ func (np *NamespaceProvisioner) DeleteNamespaceVolume(ctx context.Context, req *
 			klog.V(2).Infof("Access Point %s not found - assuming already deleted", accessPointId)
 			return &csi.DeleteVolumeResponse{}, nil
 		}
-		np.metricsCollector.RecordError("describe_accesspoint", "unknown", err)
-		return nil, fmt.Errorf("failed to describe Access Point %s: %w", accessPointId, err)
+		// If we can't describe the access point, we can't determine if it's efs-ns
+		// Return nil to signal fallback to efs-ap logic
+		// WARNING: This may indicate a persistent AWS API issue or permission problem
+		klog.Warningf("DeleteNamespaceVolume: Failed to describe Access Point %s: %v - falling back to efs-ap logic. If this is an efs-ns volume, namespace cleanup/metrics will be skipped!", accessPointId, err)
+		return nil, nil
 	}
 
-	// Extract namespace and PVC name from Access Point tags
+	// Extract namespace and PVC name from Access Point tags/metadata
+	// This determines if this is an efs-ns volume by checking the namespace mapper
 	namespace, pvcName, err := np.extractMetadataFromAccessPoint(accessPoint)
 	if err != nil {
-		klog.Warningf("Failed to extract metadata from Access Point %s: %v", accessPointId, err)
-		// Continue with deletion even if we can't extract metadata
-		namespace = "unknown"
-		pvcName = "unknown"
+		// If we can't extract metadata, this is likely not an efs-ns volume
+		// Return nil to signal fallback to efs-ap logic
+		// INFO: This is expected for efs-ap volumes, but may indicate missing metadata for efs-ns volumes
+		klog.Infof("DeleteNamespaceVolume: No namespace metadata found for Access Point %s (filesystem: %s): %v - delegating to efs-ap logic", accessPointId, accessPoint.FileSystemId, err)
+		return nil, nil
 	}
+
+	// If we successfully extracted metadata, this is an efs-ns volume - proceed with deletion
+	klog.V(2).Infof("Confirmed efs-ns volume: Access Point %s belongs to namespace %s, PVC %s", accessPointId, namespace, pvcName)
 
 	// Start volume deletion tracking
 	np.statusTracker.StartVolumeDeletion(volumeId, pvcName, namespace)
@@ -2681,8 +2701,9 @@ func (np *NamespaceProvisioner) CreateNamespaceVolume(ctx context.Context, req *
 	volSize := req.GetCapacityRange().GetRequiredBytes()
 
 	// Create the volume response
-	// Format: filesystem::accesspoint for proper parsing by node driver
-	volumeId := fmt.Sprintf("%s::%s", fileSystem.FileSystemId, accessPoint.AccessPointId)
+	// Format: fs-xxx::fsap-xxx (same as efs-ap mode for node compatibility)
+	// Node driver requires filesystem ID in volumeId for parseVolumeId
+	volumeId := fileSystem.FileSystemId + "::" + accessPoint.AccessPointId
 	volumeContext := map[string]string{
 		"accesspoint":      accessPoint.AccessPointId,
 		"filesystem":       fileSystem.FileSystemId,
@@ -3232,3 +3253,35 @@ func (n *NoOpMetricsCollector) IncAccessPointDeleted(namespace string)          
 func (n *NoOpMetricsCollector) RecordEFSCreationTime(namespace string, duration time.Duration) {}
 func (n *NoOpMetricsCollector) RecordError(operation, namespace string, err error)         {}
 func (n *NoOpMetricsCollector) SetActiveNamespaces(count int)                               {}
+
+// getAWSAccountID retrieves the AWS account ID using STS GetCallerIdentity or falls back to AWS_ROLE_ARN
+func getAWSAccountID(ctx context.Context) (string, error) {
+	// Try to extract from AWS_ROLE_ARN environment variable first (fast path for IRSA)
+	if roleArn := os.Getenv("AWS_ROLE_ARN"); roleArn != "" {
+		// Extract account ID from role ARN: arn:aws:iam::ACCOUNT_ID:role/...
+		parts := strings.Split(roleArn, ":")
+		if len(parts) >= 5 && parts[4] != "" {
+			klog.V(4).Infof("Extracted account ID from AWS_ROLE_ARN: %s", parts[4])
+			return parts[4], nil
+		}
+	}
+
+	// Fall back to STS GetCallerIdentity
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	stsClient := sts.NewFromConfig(cfg)
+	result, err := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get caller identity from STS: %w", err)
+	}
+
+	if result.Account == nil || *result.Account == "" {
+		return "", fmt.Errorf("STS GetCallerIdentity returned empty account ID")
+	}
+
+	klog.V(4).Infof("Retrieved account ID from STS GetCallerIdentity: %s", *result.Account)
+	return *result.Account, nil
+}

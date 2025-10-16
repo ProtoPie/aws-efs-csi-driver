@@ -436,20 +436,29 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	// Try to determine if this is an efs-ns volume by checking if the volumeId looks like an access point ID
-	// In efs-ns mode, volumeId is just the access point ID (fsap-xxx)
-	// In efs-ap mode, volumeId is "fs-xxx::fsap-xxx"
-	if strings.HasPrefix(volId, "fsap-") && !strings.Contains(volId, "::") {
-		// This appears to be an efs-ns volume (just access point ID)
-		provisioner, err := d.GetNamespaceProvisioner()
+	// Try to delegate to NamespaceProvisioner if it can handle this volume
+	// The NamespaceProvisioner will determine if this is an efs-ns volume by checking
+	// its internal state, cache, or CRD mappings
+	provisioner, err := d.GetNamespaceProvisioner()
+	if err != nil {
+		// If we can't initialize the provisioner, log and fall through to efs-ap logic
+		// This ensures efs-ap volumes can still be deleted even if namespace provisioner fails to init
+		klog.V(4).Infof("Failed to get NamespaceProvisioner: %v - proceeding with efs-ap deletion logic", err)
+	} else {
+		// Let the namespace provisioner attempt to handle this deletion
+		// It will return nil, nil if this is not an efs-ns volume, in which case we fall through to efs-ap logic
+		resp, err := provisioner.DeleteNamespaceVolume(ctx, req)
 		if err != nil {
-			klog.Warningf("DeleteVolume: Volume %s appears to be efs-ns mode but failed to initialize NamespaceProvisioner: %v", volId, err)
-			// Fall through to regular parsing - maybe it's a malformed efs-ap volume
-		} else {
-			return provisioner.DeleteNamespaceVolume(ctx, req)
+			return nil, err
 		}
+		if resp != nil {
+			// NamespaceProvisioner handled it
+			return resp, nil
+		}
+		// Fall through to efs-ap logic
 	}
 
+	// Handle efs-ap mode deletions
 	fileSystemId, _, accessPointId, err := parseVolumeId(volId)
 	if err != nil {
 		//Returning success for an invalid volume ID. See here - https://github.com/kubernetes-csi/csi-test/blame/5deb83d58fea909b2895731d43e32400380aae3c/pkg/sanity/controller.go#L733

@@ -171,6 +171,35 @@ func (mc *mockCloud) DescribeFileSystems(ctx context.Context, creationToken stri
 	return mc.filesystems, "", nil
 }
 
+// Additional cloud interface methods for full compatibility
+func (mc *mockCloud) WaitForFileSystemAvailable(ctx context.Context, fileSystemId string) error {
+	return fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) WaitForMountTargetsAvailable(ctx context.Context, fileSystemId string) error {
+	return fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DeleteFileSystem(ctx context.Context, fileSystemId string) error {
+	return fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) DeleteMountTarget(ctx context.Context, mountTargetId string) error {
+	return fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) ListMountTargets(ctx context.Context, fileSystemId string) ([]*cloud.MountTarget, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) GetClusterSubnets(ctx context.Context) ([]string, error) {
+	return nil, fmt.Errorf("not implemented in mock")
+}
+
+func (mc *mockCloud) GetClusterSecurityGroup(ctx context.Context) (string, error) {
+	return "", fmt.Errorf("not implemented in mock")
+}
+
 // mockMetadata implements cloud.MetadataService for testing
 type mockMetadata struct {
 	region    string
@@ -355,6 +384,12 @@ func (m *mockEFSNamespaceClient) Patch(ctx context.Context, name string, pt type
 	return nil, fmt.Errorf("patch not implemented in mock")
 }
 
+func (m *mockEFSNamespaceClient) Namespace(namespace string) efsv1alpha1.EFSNamespaceNamespaceInterface {
+	// Return self as the namespace-scoped interface
+	// In tests we don't actually use different namespaces, so this is sufficient
+	return m
+}
+
 func (m *mockEFSNamespaceClient) getCalls() []string {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
@@ -484,7 +519,7 @@ func TestCreateOrUpdateMapping(t *testing.T) {
 			fileSystemArn: "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-12345678",
 			region:        "us-east-1",
 			expectError:   false,
-			expectedCalls: []string{"Get", "Create"},
+			expectedCalls: []string{"Get", "Create", "UpdateStatus"},  // Fixed: UpdateStatus is also called
 		},
 		{
 			name:          "successful update existing mapping",
@@ -497,7 +532,7 @@ func TestCreateOrUpdateMapping(t *testing.T) {
 				// Pre-create an existing mapping
 				existing := &efsv1alpha1.EFSNamespace{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:              "existing-ns",
+						Name:              "efs-mapping",  // Fixed: resource name should be "efs-mapping"
 						CreationTimestamp: metav1.Now(),
 						ResourceVersion:   "1",
 					},
@@ -507,9 +542,9 @@ func TestCreateOrUpdateMapping(t *testing.T) {
 						Region:       "us-east-1",
 					},
 				}
-				mock.resources["existing-ns"] = existing
+				mock.resources["efs-mapping"] = existing  // Fixed: key should be "efs-mapping"
 			},
-			expectedCalls: []string{"Get", "Update"},
+			expectedCalls: []string{"Get", "Update", "UpdateStatus"},  // Fixed: UpdateStatus is also called
 		},
 	}
 
@@ -608,7 +643,7 @@ func TestGetMapping(t *testing.T) {
 			setupFunc: func(mapper *NamespaceEFSMapper, mock *mockEFSNamespaceClient) {
 				efsNamespace := &efsv1alpha1.EFSNamespace{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:              "crd-ns",
+						Name:              "efs-mapping",  // Fixed: resource name should be "efs-mapping"
 						CreationTimestamp: metav1.Now(),
 					},
 					Spec: efsv1alpha1.EFSNamespaceSpec{
@@ -618,7 +653,7 @@ func TestGetMapping(t *testing.T) {
 						Region:        "us-west-2",
 					},
 				}
-				mock.resources["crd-ns"] = efsNamespace
+				mock.resources["efs-mapping"] = efsNamespace  // Fixed: key should be "efs-mapping"
 			},
 			expectError:   false,
 			expectedCalls: []string{"Get"},
@@ -1369,7 +1404,7 @@ func TestCreateOrUpdateMappingErrorCases(t *testing.T) {
 		// Pre-create an existing mapping
 		existing := &efsv1alpha1.EFSNamespace{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:              "update-error-ns",
+				Name:              "efs-mapping",  // Fixed: resource name should be "efs-mapping"
 				CreationTimestamp: metav1.Now(),
 			},
 			Spec: efsv1alpha1.EFSNamespaceSpec{
@@ -1378,7 +1413,7 @@ func TestCreateOrUpdateMappingErrorCases(t *testing.T) {
 				Region:       "us-east-1",
 			},
 		}
-		mockClient.resources["update-error-ns"] = existing
+		mockClient.resources["efs-mapping"] = existing  // Fixed: key should be "efs-mapping"
 
 		// Set override function to return an error
 		mockClient.updateFunc = func(ctx context.Context, efsNamespace *efsv1alpha1.EFSNamespace, opts metav1.UpdateOptions) (*efsv1alpha1.EFSNamespace, error) {

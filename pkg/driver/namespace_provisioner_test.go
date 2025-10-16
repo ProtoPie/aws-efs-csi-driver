@@ -27,7 +27,10 @@ import (
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/driver/mocks"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 )
 
@@ -593,6 +596,35 @@ func (m *testMockCloud) CreateMountTarget(ctx context.Context, fileSystemId, sub
 func (m *testMockCloud) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) { return nil, nil }
 func (m *testMockCloud) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*cloud.FileSystem, string, error) { return nil, "", nil }
 
+// Additional cloud interface methods for full compatibility
+func (m *testMockCloud) WaitForFileSystemAvailable(ctx context.Context, fileSystemId string) error {
+	return nil
+}
+
+func (m *testMockCloud) WaitForMountTargetsAvailable(ctx context.Context, fileSystemId string) error {
+	return nil
+}
+
+func (m *testMockCloud) DeleteFileSystem(ctx context.Context, fileSystemId string) error {
+	return nil
+}
+
+func (m *testMockCloud) DeleteMountTarget(ctx context.Context, mountTargetId string) error {
+	return nil
+}
+
+func (m *testMockCloud) ListMountTargets(ctx context.Context, fileSystemId string) ([]*cloud.MountTarget, error) {
+	return nil, nil
+}
+
+func (m *testMockCloud) GetClusterSubnets(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (m *testMockCloud) GetClusterSecurityGroup(ctx context.Context) (string, error) {
+	return "", nil
+}
+
 type mockMapper struct {
 	createOrUpdateMappingFunc func(ctx context.Context, namespace, fileSystemID, fileSystemArn, region string) (*NamespaceEFSMapping, error)
 	getMappingFunc           func(ctx context.Context, namespace string) (*NamespaceEFSMapping, error)
@@ -703,6 +735,13 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_Success(t *testing.T) {
 		"Environment": "test",
 	}
 
+	// Create fake k8s client with test namespace
+	k8sClient := fake.NewSimpleClientset(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-namespace",
+		},
+	})
+
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
@@ -711,6 +750,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_Success(t *testing.T) {
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
 		status:           &ProvisionerStatus{},
+		k8sClient:        k8sClient,
 	}
 
 	namespace := "test-namespace"
@@ -962,6 +1002,14 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_DefaultValues(t *testing.T) {
 	metrics := &mockMetricsCollector{}
 
 	options := DefaultProvisionerOptions()
+
+	// Create fake k8s client with test namespace
+	k8sClient := fake.NewSimpleClientset(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-namespace",
+		},
+	})
+
 	provisioner := &NamespaceProvisioner{
 		cloud:            mockCloud,
 		mapper:           mapper,
@@ -970,6 +1018,7 @@ func TestNamespaceProvisioner_CreateNamespaceEFS_DefaultValues(t *testing.T) {
 		options:          options,
 		efsCache:         make(map[string]*CachedEFS),
 		status:           &ProvisionerStatus{},
+		k8sClient:        k8sClient,
 	}
 
 	var capturedOptions *cloud.FileSystemOptions

@@ -18,24 +18,46 @@ package driver
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
 	cloudMocks "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud/mocks"
 )
 
+func fakeRestConfig() *rest.Config {
+	return &rest.Config{
+		Host: "https://fake-k8s-api-server:6443",
+	}
+}
+
+func setupTestEnv() func() {
+	// Set fake AWS_ROLE_ARN to avoid STS calls in tests
+	oldRoleArn := os.Getenv("AWS_ROLE_ARN")
+	os.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test-role")
+
+	return func() {
+		if oldRoleArn != "" {
+			os.Setenv("AWS_ROLE_ARN", oldRoleArn)
+		} else {
+			os.Unsetenv("AWS_ROLE_ARN")
+		}
+	}
+}
+
 func TestPVFinalizer(t *testing.T) {
+	cleanup := setupTestEnv()
+	defer cleanup()
 	t.Run("PV with Delete reclaim policy should have finalizer added", func(t *testing.T) {
 		ctx := context.Background()
 		ctrl := gomock.NewController(t)
@@ -66,7 +88,7 @@ func TestPVFinalizer(t *testing.T) {
 		k8sClient := fake.NewSimpleClientset(pv)
 
 		// Create provisioner
-		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 		assert.NoError(t, err)
 
 		// Add finalizer
@@ -116,7 +138,7 @@ func TestPVFinalizer(t *testing.T) {
 		mockCloud.EXPECT().DeleteAccessPoint(gomock.Any(), accessPointId).Return(nil)
 
 		// Create provisioner
-		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 		assert.NoError(t, err)
 
 		// Handle PV deletion
@@ -132,7 +154,6 @@ func TestPVFinalizer(t *testing.T) {
 	})
 
 	t.Run("PV with Retain policy should not have finalizer", func(t *testing.T) {
-		ctx := context.Background()
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
@@ -161,7 +182,7 @@ func TestPVFinalizer(t *testing.T) {
 		k8sClient := fake.NewSimpleClientset(pv)
 
 		// Create provisioner
-		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 		assert.NoError(t, err)
 
 		// Check if PV should have finalizer (it shouldn't for Retain policy)
@@ -208,7 +229,7 @@ func TestPVFinalizer(t *testing.T) {
 		mockCloud.EXPECT().DeleteAccessPoint(gomock.Any(), accessPointId).Return(cloud.ErrNotFound)
 
 		// Create provisioner
-		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 		assert.NoError(t, err)
 
 		// Handle PV deletion
@@ -225,13 +246,16 @@ func TestPVFinalizer(t *testing.T) {
 }
 
 func TestIsEFSNamespaceProvisionedPV(t *testing.T) {
+	cleanup := setupTestEnv()
+	defer cleanup()
+
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockCloud := mocks.NewMockCloud(ctrl)
+	mockCloud := cloudMocks.NewMockCloud(ctrl)
 	k8sClient := fake.NewSimpleClientset()
 
-	np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+	np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 	assert.NoError(t, err)
 
 	tests := []struct {
@@ -322,6 +346,9 @@ func TestIsEFSNamespaceProvisionedPV(t *testing.T) {
 }
 
 func TestPVWatcher(t *testing.T) {
+	cleanup := setupTestEnv()
+	defer cleanup()
+
 	t.Run("PV watcher should start and stop correctly", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -337,7 +364,7 @@ func TestPVWatcher(t *testing.T) {
 		k8sClient.PrependWatchReactor("persistentvolumes", k8stesting.DefaultWatchReactor(watcher, nil))
 
 		// Create provisioner
-		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, nil, DefaultProvisionerOptions())
+		np, err := NewNamespaceProvisioner(mockCloud, k8sClient, fakeRestConfig(), DefaultProvisionerOptions())
 		assert.NoError(t, err)
 
 		// Start PV watcher
