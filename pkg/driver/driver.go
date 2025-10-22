@@ -18,12 +18,15 @@ package driver
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
@@ -54,6 +57,7 @@ type Driver struct {
 	adaptiveRetryMode        bool
 	tags                     map[string]string
 	lockManager              LockManagerMap
+	namespaceProvisioner     NamespaceProvisionerInterface
 }
 
 func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, volMetricsOptIn bool, volMetricsRefreshPeriod float64, volMetricsFsRateLimit int, deleteAccessPointRootDir bool, adaptiveRetryMode bool) *Driver {
@@ -80,7 +84,80 @@ func NewDriver(endpoint, efsUtilsCfgPath, efsUtilsStaticFilesPath, tags string, 
 		adaptiveRetryMode:        adaptiveRetryMode,
 		tags:                     parseTagsFromStr(strings.TrimSpace(tags)),
 		lockManager:              NewLockManagerMap(),
+		namespaceProvisioner:     nil, // Will be initialized when needed
 	}
+}
+
+// SetNamespaceProvisioner sets the namespace provisioner for the driver
+func (d *Driver) SetNamespaceProvisioner(namespaceProvisioner NamespaceProvisionerInterface) {
+	d.namespaceProvisioner = namespaceProvisioner
+}
+
+// InitializeNamespaceProvisioner initializes the namespace provisioner if not already initialized
+// This is called lazily when the first efs-ns mode volume is requested
+func (d *Driver) InitializeNamespaceProvisioner() error {
+	if d.namespaceProvisioner != nil {
+		klog.V(4).Infof("NamespaceProvisioner already initialized")
+		return nil
+	}
+
+	klog.Info("Initializing NamespaceProvisioner for efs-ns mode")
+
+	// Get Kubernetes client
+	k8sClient, err := cloud.DefaultKubernetesAPIClient()
+	if err != nil {
+		return fmt.Errorf("failed to get Kubernetes client: %w", err)
+	}
+
+	// Get Kubernetes config
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get Kubernetes config: %w", err)
+	}
+
+	// Create provisioner options with default values
+	// These can be customized later based on StorageClass parameters
+	options := DefaultProvisionerOptions()
+
+	// Set cluster-wide tags from the Driver
+	options.DefaultTags = d.tags
+
+	// Set cluster ID if available
+	if clusterID := os.Getenv("CLUSTER_NAME"); clusterID != "" {
+		options.ClusterID = clusterID
+	}
+
+	// Set region from metadata
+	metadata := d.cloud.GetMetadata()
+	options.Region = metadata.GetRegion()
+
+	// Initialize the NamespaceProvisioner
+	provisioner, err := NewNamespaceProvisioner(d.cloud, k8sClient, config, options)
+	if err != nil {
+		return fmt.Errorf("failed to create NamespaceProvisioner: %w", err)
+	}
+
+	// Start the provisioner
+	ctx := context.Background()
+	if err := provisioner.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start NamespaceProvisioner: %w", err)
+	}
+
+	// Set the provisioner in the driver
+	d.namespaceProvisioner = provisioner
+
+	klog.Info("NamespaceProvisioner initialized successfully")
+	return nil
+}
+
+// GetNamespaceProvisioner returns the namespace provisioner, initializing it if necessary
+func (d *Driver) GetNamespaceProvisioner() (NamespaceProvisionerInterface, error) {
+	if d.namespaceProvisioner == nil {
+		if err := d.InitializeNamespaceProvisioner(); err != nil {
+			return nil, err
+		}
+	}
+	return d.namespaceProvisioner, nil
 }
 
 func SetNodeCapOptInFeatures(volMetricsOptIn bool) []csi.NodeServiceCapability_RPC_Type {
@@ -140,6 +217,26 @@ func (d *Driver) Run() error {
 
 	klog.Infof("Listening for connections on address: %#v", listener.Addr())
 	return d.srv.Serve(listener)
+}
+
+// Stop gracefully stops the CSI driver and cleans up resources
+func (d *Driver) Stop() {
+	klog.Info("Stopping CSI driver")
+
+	// Stop the NamespaceProvisioner if it was initialized
+	if d.namespaceProvisioner != nil {
+		klog.Info("Stopping NamespaceProvisioner")
+		if err := d.namespaceProvisioner.Stop(); err != nil {
+			klog.Errorf("Error stopping NamespaceProvisioner: %v", err)
+		}
+	}
+
+	// Stop the gRPC server if it's running
+	if d.srv != nil {
+		d.srv.GracefulStop()
+	}
+
+	klog.Info("CSI driver stopped")
 }
 
 func parseTagsFromStr(tagStr string) map[string]string {

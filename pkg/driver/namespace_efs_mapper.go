@@ -1,0 +1,670 @@
+/*
+Copyright 2024 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package driver
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+
+	efsv1alpha1 "github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/apis/efs/v1alpha1"
+	"github.com/kubernetes-sigs/aws-efs-csi-driver/pkg/cloud"
+)
+
+// NamespaceEFSMapping represents the mapping between a namespace and EFS filesystem
+type NamespaceEFSMapping struct {
+	Namespace      string    `json:"namespace"`
+	FileSystemID   string    `json:"fileSystemId"`
+	FileSystemArn  string    `json:"fileSystemArn"`
+	Region         string    `json:"region"`
+	CreationTime   time.Time `json:"creationTime"`
+	LastAccessTime time.Time `json:"lastAccessTime"`
+}
+
+// NamespaceEFSMapperInterface defines the interface for namespace-to-EFS mapping operations
+type NamespaceEFSMapperInterface interface {
+	// CRUD operations
+	CreateOrUpdateMapping(ctx context.Context, namespace, fileSystemID, fileSystemArn, region string) (*NamespaceEFSMapping, error)
+	GetMapping(ctx context.Context, namespace string) (*NamespaceEFSMapping, error)
+	DeleteMapping(ctx context.Context, namespace string) error
+	ListMappings(ctx context.Context) ([]NamespaceEFSMapping, error)
+
+	// Lifecycle management
+	Start(ctx context.Context) error
+	Stop()
+
+	// Cache operations
+	InvalidateCache(namespace string)
+	ClearCache()
+
+	// Recovery operations
+	RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error)
+	SyncWithAWSTags(ctx context.Context, clusterID string) error
+
+	// EFS filesystem discovery
+	DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error)
+}
+
+// NamespaceEFSMapper manages the mapping between Kubernetes namespaces and EFS filesystems
+// using CRD-based persistence with local caching for performance
+type NamespaceEFSMapper struct {
+	// CRD client for persistent storage
+	crdClient efsv1alpha1.EFSNamespaceInterface
+
+	// Kubernetes client for general operations
+	k8sClient kubernetes.Interface
+
+	// AWS cloud client for tag-based recovery
+	cloudClient cloud.Cloud
+
+	// Local cache for performance optimization
+	cache      map[string]*NamespaceEFSMapping
+	cacheMutex sync.RWMutex
+
+	// Informer for real-time CRD updates
+	informer cache.SharedIndexInformer
+	stopCh   chan struct{}
+
+	// Configuration
+	resyncPeriod    time.Duration
+	syncPeriod      time.Duration
+	lastSyncTime    time.Time
+	syncMutex       sync.Mutex
+
+	// Initialization state
+	initialized bool
+	initMutex   sync.Mutex
+}
+
+// NewNamespaceEFSMapper creates a new instance of NamespaceEFSMapper
+func NewNamespaceEFSMapper(k8sClient kubernetes.Interface, config *rest.Config, cloudClient cloud.Cloud) (*NamespaceEFSMapper, error) {
+	if k8sClient == nil {
+		return nil, fmt.Errorf("kubernetes client cannot be nil")
+	}
+	if config == nil {
+		return nil, fmt.Errorf("rest config cannot be nil")
+	}
+	if cloudClient == nil {
+		return nil, fmt.Errorf("cloud client cannot be nil")
+	}
+
+	// Create CRD client
+	crdClient, err := efsv1alpha1.NewEFSNamespaceClient(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create EFSNamespace CRD client: %w", err)
+	}
+
+	mapper := &NamespaceEFSMapper{
+		crdClient:    crdClient,
+		k8sClient:    k8sClient,
+		cloudClient:  cloudClient,
+		cache:        make(map[string]*NamespaceEFSMapping),
+		resyncPeriod: 5 * time.Minute,  // Default resync period
+		syncPeriod:   30 * time.Minute, // Default sync period for tag recovery
+		stopCh:       make(chan struct{}),
+	}
+
+	return mapper, nil
+}
+
+// Start initializes the mapper and starts the informer for real-time updates
+func (m *NamespaceEFSMapper) Start(ctx context.Context) error {
+	m.initMutex.Lock()
+	defer m.initMutex.Unlock()
+
+	if m.initialized {
+		return nil
+	}
+
+	klog.V(2).InfoS("Starting NamespaceEFSMapper")
+
+	// Create informer for real-time CRD updates
+	m.informer = efsv1alpha1.NewEFSNamespaceInformer(m.crdClient, m.resyncPeriod)
+
+	// Add event handlers for cache synchronization
+	m.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if efsNamespace, ok := obj.(*efsv1alpha1.EFSNamespace); ok {
+				m.onEFSNamespaceAdd(efsNamespace)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			if efsNamespace, ok := newObj.(*efsv1alpha1.EFSNamespace); ok {
+				m.onEFSNamespaceUpdate(efsNamespace)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			if efsNamespace, ok := obj.(*efsv1alpha1.EFSNamespace); ok {
+				m.onEFSNamespaceDelete(efsNamespace)
+			}
+		},
+	})
+
+	// Start the informer in a goroutine
+	go m.informer.Run(m.stopCh)
+
+	// Wait for cache synchronization
+	if !cache.WaitForCacheSync(ctx.Done(), m.informer.HasSynced) {
+		return fmt.Errorf("failed to sync EFSNamespace informer cache")
+	}
+
+	// Load initial cache from CRD
+	if err := m.loadCacheFromCRD(ctx); err != nil {
+		klog.ErrorS(err, "Failed to load initial cache from CRD, continuing with empty cache")
+	}
+
+	m.initialized = true
+	klog.V(2).InfoS("NamespaceEFSMapper started successfully")
+	return nil
+}
+
+// Stop gracefully shuts down the mapper
+func (m *NamespaceEFSMapper) Stop() {
+	m.initMutex.Lock()
+	defer m.initMutex.Unlock()
+
+	if !m.initialized {
+		return
+	}
+
+	klog.V(2).InfoS("Stopping NamespaceEFSMapper")
+	close(m.stopCh)
+	m.initialized = false
+	klog.V(2).InfoS("NamespaceEFSMapper stopped")
+}
+
+// CreateOrUpdateMapping creates or updates a namespace-to-EFS mapping
+func (m *NamespaceEFSMapper) CreateOrUpdateMapping(ctx context.Context, namespace, fileSystemID, fileSystemArn, region string) (*NamespaceEFSMapping, error) {
+	if namespace == "" || fileSystemID == "" || region == "" {
+		return nil, fmt.Errorf("namespace, fileSystemID, and region are required")
+	}
+
+	klog.V(4).InfoS("Creating or updating namespace EFS mapping",
+		"namespace", namespace,
+		"fileSystemID", fileSystemID,
+		"region", region)
+
+	// Create or update the CRD resource
+	// For namespaced CRDs, the resource is created in the same namespace it represents
+	efsNamespace := &efsv1alpha1.EFSNamespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "efs-mapping", // Use a fixed name for the mapping within each namespace
+			Namespace: namespace,      // Set the namespace for the CRD resource
+		},
+		Spec: efsv1alpha1.EFSNamespaceSpec{
+			Namespace:     namespace,
+			FileSystemID:  fileSystemID,
+			FileSystemArn: fileSystemArn,
+			Region:        region,
+		},
+	}
+
+	var result *efsv1alpha1.EFSNamespace
+	var err error
+
+	// Try to get existing resource first
+	// For namespaced resources, we need to specify the namespace
+	existing, getErr := m.crdClient.Namespace(namespace).Get(ctx, "efs-mapping", metav1.GetOptions{})
+	if getErr != nil && !errors.IsNotFound(getErr) {
+		return nil, fmt.Errorf("failed to check existing EFSNamespace: %w", getErr)
+	}
+
+	if errors.IsNotFound(getErr) {
+		// Set initial status
+		efsNamespace.Status = efsv1alpha1.EFSNamespaceStatus{
+			State:         "Provisioning",
+			FileSystemID:  fileSystemID,
+			FileSystemArn: fileSystemArn,
+			LastUpdated:   &metav1.Time{Time: time.Now()},
+			Message:       "EFS filesystem mapped to namespace",
+		}
+
+		// Create new resource
+		result, err = m.crdClient.Namespace(namespace).Create(ctx, efsNamespace, metav1.CreateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create EFSNamespace CRD: %w", err)
+		}
+
+		// Update status separately (CRDs require separate status updates)
+		result.Status = efsNamespace.Status
+		result, err = m.crdClient.Namespace(namespace).UpdateStatus(ctx, result, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Warningf("Failed to update EFSNamespace status: %v", err)
+			// Don't fail the operation, status update is not critical
+		}
+
+		klog.V(2).InfoS("Created new EFSNamespace CRD", "namespace", namespace, "fileSystemID", fileSystemID)
+	} else {
+		// Update existing resource
+		existing.Spec.FileSystemID = fileSystemID
+		existing.Spec.FileSystemArn = fileSystemArn
+		existing.Spec.Region = region
+
+		result, err = m.crdClient.Namespace(namespace).Update(ctx, existing, metav1.UpdateOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to update EFSNamespace CRD: %w", err)
+		}
+
+		// Update status
+		existing.Status.State = "Active"
+		existing.Status.FileSystemID = fileSystemID
+		existing.Status.FileSystemArn = fileSystemArn
+		existing.Status.LastUpdated = &metav1.Time{Time: time.Now()}
+		existing.Status.Message = "EFS filesystem successfully mapped"
+		existing.Status.ObservedGeneration = result.Generation
+
+		result, err = m.crdClient.Namespace(namespace).UpdateStatus(ctx, existing, metav1.UpdateOptions{})
+		if err != nil {
+			klog.Warningf("Failed to update EFSNamespace status: %v", err)
+			// Don't fail the operation, status update is not critical
+		}
+
+		klog.V(2).InfoS("Updated existing EFSNamespace CRD", "namespace", namespace, "fileSystemID", fileSystemID)
+	}
+
+	// Create mapping object
+	mapping := &NamespaceEFSMapping{
+		Namespace:      namespace,
+		FileSystemID:   fileSystemID,
+		FileSystemArn:  fileSystemArn,
+		Region:         region,
+		CreationTime:   result.CreationTimestamp.Time,
+		LastAccessTime: time.Now(),
+	}
+
+	// Update local cache
+	m.updateCache(namespace, mapping)
+
+	return mapping, nil
+}
+
+// GetMapping retrieves a namespace-to-EFS mapping
+func (m *NamespaceEFSMapper) GetMapping(ctx context.Context, namespace string) (*NamespaceEFSMapping, error) {
+	if namespace == "" {
+		return nil, fmt.Errorf("namespace is required")
+	}
+
+	klog.V(4).InfoS("Getting namespace EFS mapping", "namespace", namespace)
+
+	// Try cache first for performance
+	if mapping := m.getCachedMapping(namespace); mapping != nil {
+		// Update last access time
+		mapping.LastAccessTime = time.Now()
+		m.updateCache(namespace, mapping)
+		klog.V(4).InfoS("Found mapping in cache", "namespace", namespace, "fileSystemID", mapping.FileSystemID)
+		return mapping, nil
+	}
+
+	// Fallback to CRD if not in cache
+	efsNamespace, err := m.crdClient.Namespace(namespace).Get(ctx, "efs-mapping", metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			klog.V(4).InfoS("No EFS mapping found for namespace", "namespace", namespace)
+			return nil, nil // Return nil without error for not found
+		}
+		return nil, fmt.Errorf("failed to get EFSNamespace CRD: %w", err)
+	}
+
+	// Create mapping from CRD data
+	mapping := &NamespaceEFSMapping{
+		Namespace:      efsNamespace.Spec.Namespace,
+		FileSystemID:   efsNamespace.Spec.FileSystemID,
+		FileSystemArn:  efsNamespace.Spec.FileSystemArn,
+		Region:         efsNamespace.Spec.Region,
+		CreationTime:   efsNamespace.CreationTimestamp.Time,
+		LastAccessTime: time.Now(),
+	}
+
+	// Update cache for future requests
+	m.updateCache(namespace, mapping)
+
+	klog.V(4).InfoS("Found mapping in CRD", "namespace", namespace, "fileSystemID", mapping.FileSystemID)
+	return mapping, nil
+}
+
+// DeleteMapping deletes a namespace-to-EFS mapping
+func (m *NamespaceEFSMapper) DeleteMapping(ctx context.Context, namespace string) error {
+	if namespace == "" {
+		return fmt.Errorf("namespace is required")
+	}
+
+	klog.V(2).InfoS("Deleting namespace EFS mapping", "namespace", namespace)
+
+	// Delete from CRD
+	err := m.crdClient.Namespace(namespace).Delete(ctx, "efs-mapping", metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete EFSNamespace CRD: %w", err)
+	}
+
+	// Remove from cache
+	m.invalidateCache(namespace)
+
+	klog.V(2).InfoS("Deleted namespace EFS mapping", "namespace", namespace)
+	return nil
+}
+
+// ListMappings returns all namespace-to-EFS mappings
+func (m *NamespaceEFSMapper) ListMappings(ctx context.Context) ([]NamespaceEFSMapping, error) {
+	klog.V(4).InfoS("Listing all namespace EFS mappings")
+
+	// For namespaced CRDs, we need to list across all namespaces
+	// Use empty string for namespace to list across all namespaces
+	efsNamespaceList, err := m.crdClient.Namespace("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list EFSNamespace CRDs: %w", err)
+	}
+
+	mappings := make([]NamespaceEFSMapping, 0, len(efsNamespaceList.Items))
+	for _, efsNamespace := range efsNamespaceList.Items {
+		mapping := NamespaceEFSMapping{
+			Namespace:      efsNamespace.Spec.Namespace,
+			FileSystemID:   efsNamespace.Spec.FileSystemID,
+			FileSystemArn:  efsNamespace.Spec.FileSystemArn,
+			Region:         efsNamespace.Spec.Region,
+			CreationTime:   efsNamespace.CreationTimestamp.Time,
+			LastAccessTime: time.Now(),
+		}
+		mappings = append(mappings, mapping)
+
+		// Update cache as we go
+		m.updateCache(efsNamespace.Spec.Namespace, &mapping)
+	}
+
+	klog.V(4).InfoS("Listed namespace EFS mappings", "count", len(mappings))
+	return mappings, nil
+}
+
+// InvalidateCache removes a specific namespace from the cache
+func (m *NamespaceEFSMapper) InvalidateCache(namespace string) {
+	m.invalidateCache(namespace)
+}
+
+// ClearCache removes all entries from the cache
+func (m *NamespaceEFSMapper) ClearCache() {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+
+	m.cache = make(map[string]*NamespaceEFSMapping)
+	klog.V(4).InfoS("Cleared namespace EFS mapping cache")
+}
+
+// Private helper methods
+
+func (m *NamespaceEFSMapper) getCachedMapping(namespace string) *NamespaceEFSMapping {
+	m.cacheMutex.RLock()
+	defer m.cacheMutex.RUnlock()
+
+	if mapping, exists := m.cache[namespace]; exists {
+		// Return a copy to prevent external modifications
+		mappingCopy := *mapping
+		return &mappingCopy
+	}
+	return nil
+}
+
+func (m *NamespaceEFSMapper) updateCache(namespace string, mapping *NamespaceEFSMapping) {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+
+	// Store a copy to prevent external modifications
+	mappingCopy := *mapping
+	m.cache[namespace] = &mappingCopy
+}
+
+func (m *NamespaceEFSMapper) invalidateCache(namespace string) {
+	m.cacheMutex.Lock()
+	defer m.cacheMutex.Unlock()
+
+	delete(m.cache, namespace)
+	klog.V(4).InfoS("Invalidated cache for namespace", "namespace", namespace)
+}
+
+func (m *NamespaceEFSMapper) loadCacheFromCRD(ctx context.Context) error {
+	klog.V(4).InfoS("Loading initial cache from CRD")
+
+	mappings, err := m.ListMappings(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load mappings from CRD: %w", err)
+	}
+
+	klog.V(4).InfoS("Loaded initial cache from CRD", "mappingCount", len(mappings))
+	return nil
+}
+
+// Informer event handlers
+
+func (m *NamespaceEFSMapper) onEFSNamespaceAdd(efsNamespace *efsv1alpha1.EFSNamespace) {
+	klog.V(4).InfoS("EFSNamespace added", "namespace", efsNamespace.Spec.Namespace)
+
+	mapping := &NamespaceEFSMapping{
+		Namespace:      efsNamespace.Spec.Namespace,
+		FileSystemID:   efsNamespace.Spec.FileSystemID,
+		FileSystemArn:  efsNamespace.Spec.FileSystemArn,
+		Region:         efsNamespace.Spec.Region,
+		CreationTime:   efsNamespace.CreationTimestamp.Time,
+		LastAccessTime: time.Now(),
+	}
+
+	m.updateCache(efsNamespace.Spec.Namespace, mapping)
+}
+
+func (m *NamespaceEFSMapper) onEFSNamespaceUpdate(efsNamespace *efsv1alpha1.EFSNamespace) {
+	klog.V(4).InfoS("EFSNamespace updated", "namespace", efsNamespace.Spec.Namespace)
+
+	mapping := &NamespaceEFSMapping{
+		Namespace:      efsNamespace.Spec.Namespace,
+		FileSystemID:   efsNamespace.Spec.FileSystemID,
+		FileSystemArn:  efsNamespace.Spec.FileSystemArn,
+		Region:         efsNamespace.Spec.Region,
+		CreationTime:   efsNamespace.CreationTimestamp.Time,
+		LastAccessTime: time.Now(),
+	}
+
+	m.updateCache(efsNamespace.Spec.Namespace, mapping)
+}
+
+func (m *NamespaceEFSMapper) onEFSNamespaceDelete(efsNamespace *efsv1alpha1.EFSNamespace) {
+	klog.V(4).InfoS("EFSNamespace deleted", "namespace", efsNamespace.Spec.Namespace)
+	m.invalidateCache(efsNamespace.Spec.Namespace)
+}
+
+// RecoverFromAWSTags recovers namespace-to-EFS mappings from AWS tags
+// This is used when CRD data is lost but EFS filesystems still exist with proper tags
+func (m *NamespaceEFSMapper) RecoverFromAWSTags(ctx context.Context, clusterID string) (int, error) {
+	if clusterID == "" {
+		return 0, fmt.Errorf("clusterID cannot be empty")
+	}
+
+	klog.V(2).InfoS("Starting tag-based recovery", "clusterID", clusterID)
+
+	// Define the tags to search for namespace-provisioned EFS filesystems
+	searchTags := map[string]string{
+		"kubernetes.io/cluster/" + clusterID: "owned",
+		"kubernetes.io/provisioning-mode":   "efs-ns",
+	}
+
+	// Find EFS filesystems with the required tags
+	fileSystems, err := m.cloudClient.FindFileSystemsByTags(ctx, searchTags)
+	if err != nil {
+		return 0, fmt.Errorf("failed to find file systems by tags: %w", err)
+	}
+
+	klog.V(4).InfoS("Found file systems for recovery", "count", len(fileSystems), "clusterID", clusterID)
+
+	recoveredCount := 0
+	for _, fs := range fileSystems {
+		// Get all tags for this filesystem to extract namespace information
+		tags, err := m.cloudClient.GetFileSystemTags(ctx, fs.FileSystemId)
+		if err != nil {
+			klog.ErrorS(err, "Failed to get tags for filesystem during recovery", "fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		// Extract namespace from tags
+		namespace, exists := tags["kubernetes.io/namespace"]
+		if !exists || namespace == "" {
+			klog.V(2).InfoS("Skipping filesystem without namespace tag", "fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		// Get region from metadata (this could also come from tags if needed)
+		region := m.cloudClient.GetMetadata().GetRegion()
+
+		// Get FileSystemArn from tags - skip filesystem if not available
+		fileSystemArn, hasArn := tags["kubernetes.io/filesystem-arn"]
+		if !hasArn {
+			// Skip this filesystem if ARN is not available in tags
+			klog.V(4).InfoS("Skipping filesystem without ARN tag", "fileSystemId", fs.FileSystemId)
+			continue
+		}
+
+		// Check if mapping already exists
+		existingMapping, err := m.GetMapping(ctx, namespace)
+		if err != nil {
+			klog.ErrorS(err, "Failed to check existing mapping during recovery", "namespace", namespace)
+			continue
+		}
+
+		if existingMapping != nil {
+			// Mapping already exists, check if it matches
+			if existingMapping.FileSystemID == fs.FileSystemId {
+				klog.V(4).InfoS("Mapping already exists and matches", "namespace", namespace, "fileSystemID", fs.FileSystemId)
+				continue
+			} else {
+				klog.V(2).InfoS("Mapping exists but with different filesystem",
+					"namespace", namespace,
+					"existingFS", existingMapping.FileSystemID,
+					"taggedFS", fs.FileSystemId)
+				continue
+			}
+		}
+
+		// Create the mapping
+		_, err = m.CreateOrUpdateMapping(ctx, namespace, fs.FileSystemId, fileSystemArn, region)
+		if err != nil {
+			klog.ErrorS(err, "Failed to create mapping during recovery",
+				"namespace", namespace,
+				"fileSystemID", fs.FileSystemId)
+			continue
+		}
+
+		recoveredCount++
+		klog.V(2).InfoS("Recovered mapping from tags",
+			"namespace", namespace,
+			"fileSystemID", fs.FileSystemId)
+	}
+
+	klog.V(2).InfoS("Tag-based recovery completed",
+		"recoveredCount", recoveredCount,
+		"totalFound", len(fileSystems))
+
+	return recoveredCount, nil
+}
+
+// SyncWithAWSTags performs periodic synchronization with AWS tags
+// This ensures consistency between CRD state and actual AWS resources
+func (m *NamespaceEFSMapper) SyncWithAWSTags(ctx context.Context, clusterID string) error {
+	m.syncMutex.Lock()
+	defer m.syncMutex.Unlock()
+
+	// Check if enough time has passed since last sync
+	if time.Since(m.lastSyncTime) < m.syncPeriod {
+		klog.V(4).InfoS("Skipping sync, not enough time elapsed",
+			"timeSinceLastSync", time.Since(m.lastSyncTime),
+			"syncPeriod", m.syncPeriod)
+		return nil
+	}
+
+	klog.V(4).InfoS("Starting periodic sync with AWS tags", "clusterID", clusterID)
+
+	// Perform recovery to sync any missing mappings
+	recoveredCount, err := m.RecoverFromAWSTags(ctx, clusterID)
+	if err != nil {
+		klog.ErrorS(err, "Failed to sync with AWS tags")
+		return fmt.Errorf("failed to sync with AWS tags: %w", err)
+	}
+
+	// Update last sync time
+	m.lastSyncTime = time.Now()
+
+	klog.V(4).InfoS("Periodic sync completed",
+		"recoveredCount", recoveredCount,
+		"lastSyncTime", m.lastSyncTime)
+
+	return nil
+}
+
+// SetSyncPeriod allows configuring the sync period for tag-based recovery
+func (m *NamespaceEFSMapper) SetSyncPeriod(period time.Duration) {
+	m.syncMutex.Lock()
+	defer m.syncMutex.Unlock()
+
+	if period < time.Minute {
+		period = time.Minute // Minimum 1 minute
+	}
+
+	m.syncPeriod = period
+	klog.V(4).InfoS("Updated sync period", "syncPeriod", period)
+}
+
+// DescribeFileSystems lists all EFS filesystems and provides efficient caching and round-robin selection
+// This method supports dynamic filesystem discovery and selection for namespace provisioning
+func (m *NamespaceEFSMapper) DescribeFileSystems(ctx context.Context) ([]*cloud.FileSystem, error) {
+	klog.V(4).InfoS("Describing EFS filesystems for namespace provisioning")
+
+	// Use the cloud client to list all filesystems
+	// This provides more efficient querying than tag-based search
+	fileSystems, _, err := m.cloudClient.DescribeFileSystems(ctx, "", 100)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe filesystems: %w", err)
+	}
+
+	// Filter filesystems based on namespace provisioning tags if needed
+	var namespaceFSList []*cloud.FileSystem
+	for _, fs := range fileSystems {
+		// Check if this filesystem is managed for namespace provisioning
+		if fs.Tags != nil {
+			if mode, ok := fs.Tags["kubernetes.io/provisioning-mode"]; ok && mode == "efs-ns" {
+				namespaceFSList = append(namespaceFSList, fs)
+				klog.V(5).InfoS("Found namespace-provisioned filesystem",
+					"fileSystemId", fs.FileSystemId,
+					"namespace", fs.Tags["kubernetes.io/namespace"])
+			}
+		}
+	}
+
+	klog.V(4).InfoS("Described filesystems",
+		"totalCount", len(fileSystems),
+		"namespaceProvisionedCount", len(namespaceFSList))
+
+	// If no namespace-provisioned filesystems found, return all available filesystems
+	// This allows the provisioner to select from the general pool
+	if len(namespaceFSList) == 0 {
+		klog.V(4).InfoS("No namespace-provisioned filesystems found, returning all available filesystems")
+		return fileSystems, nil
+	}
+
+	return namespaceFSList, nil
+}

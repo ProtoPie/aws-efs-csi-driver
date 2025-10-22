@@ -107,8 +107,37 @@ controller:
   healthPort: 9909
   regionalStsEndpoints: false
   # Pod Disruption Budget
-  podDisruptionBudget: 
+  podDisruptionBudget:
     enabled: false
+  # EFS Namespace Provisioning Mode Configuration
+  efsNamespaceProvisioning:
+    # Enable EFS namespace provisioning mode (efs-ns)
+    enabled: false
+    # Cleanup policy when namespace is deleted (retain/delete)
+    defaultCleanupPolicy: retain
+    # Default EFS configuration for new filesystems
+    defaultEfsConfig:
+      performanceMode: generalPurpose
+      throughputMode: bursting
+      encrypted: true
+      backupPolicy: ENABLED
+      lifecyclePolicy: ""  # empty means no lifecycle policy
+    # AWS configuration
+    awsConfig:
+      # Region where EFS filesystems will be created (uses cluster region if not specified)
+      region: ""
+      # KMS key ID for encryption (uses AWS managed key if not specified)
+      kmsKeyId: ""
+      # Security group IDs for mount targets (uses default VPC security group if not specified)
+      securityGroupIds: []
+      # Subnet IDs for mount targets (auto-discovers if not specified)
+      subnetIds: []
+    # CRD configuration
+    crd:
+      # Whether to install the EFSNamespace CRD
+      install: true
+      # Whether to keep CRDs on chart uninstall
+      keep: true
     # maxUnavailable: 1
     minAvailable: 1
     unhealthyPodEvictionPolicy: IfHealthyBudget

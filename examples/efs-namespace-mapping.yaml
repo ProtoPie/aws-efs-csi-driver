@@ -1,0 +1,40 @@
+---
+# Example of EFSNamespace CRD as a namespaced resource
+# This resource will be created within the specified namespace
+apiVersion: efs.csi.aws.com/v1alpha1
+kind: EFSNamespace
+metadata:
+  name: efs-mapping  # Fixed name for the mapping within each namespace
+  namespace: test-namespace  # The namespace where this resource is created
+spec:
+  namespace: test-namespace  # The namespace this mapping represents
+  region: us-west-2
+  fileSystemId: fs-12345678  # Optional - will be auto-created if not specified
+  performanceMode: generalPurpose
+  throughputMode: bursting
+  encrypted: true
+  backupPolicy: ENABLED
+  cleanupPolicy: retain
+  tags:
+    Environment: development
+    Project: test
+---
+# Another example in a different namespace
+apiVersion: efs.csi.aws.com/v1alpha1
+kind: EFSNamespace
+metadata:
+  name: efs-mapping  # Same resource name but in different namespace
+  namespace: production-namespace
+spec:
+  namespace: production-namespace
+  region: us-west-2
+  performanceMode: maxIO
+  throughputMode: provisioned
+  provisionedThroughputInMibps: 100
+  encrypted: true
+  lifecyclePolicy: AFTER_30_DAYS
+  backupPolicy: ENABLED
+  cleanupPolicy: retain
+  tags:
+    Environment: production
+    Project: main-app

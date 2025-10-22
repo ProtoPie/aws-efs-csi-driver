@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM public.ecr.aws/eks-distro-build-tooling/golang:1.24.0 as go-builder
+FROM golang:alpine as go-builder
+RUN apk add --no-cache git make gcc musl-dev
 WORKDIR /go/src/github.com/kubernetes-sigs/aws-efs-csi-driver
 
 ARG TARGETOS
@@ -28,80 +29,75 @@ ENV EFS_CLIENT_SOURCE=$client_source
 
 RUN OS=${TARGETOS} ARCH=${TARGETARCH} make $TARGETOS/$TARGETARCH
 
-FROM public.ecr.aws/eks-distro-build-tooling/python:3.11-gcc-al23 as rpm-provider
+FROM amazonlinux:2023 as rpm-provider
 
-# Install efs-utils from github by default. It can be overriden to `yum` with --build-arg when building the Docker image.
-# If value of `EFSUTILSSOURCE` build arg is overriden with `yum`, docker will install efs-utils from Amazon Linux 2's yum repo.
-ARG EFSUTILSSOURCE=github
+# Install Python 3 and required packages
+RUN yum -y install python3 python3-pip gcc
+
+# Install efs-utils directly from the repository
 RUN mkdir -p /tmp/rpms && \
-    if [ "$EFSUTILSSOURCE" = "yum" ]; \
-    then echo "Installing efs-utils from Amazon Linux 2 yum repo" && \
-         yum -y install --downloadonly --downloaddir=/tmp/rpms amazon-efs-utils-1.35.0-1.amzn2.noarch; \
-    else echo "Installing efs-utils from github using the latest git tag" && \
-         yum -y install systemd git rpm-build make openssl-devel curl && \
-         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-         source $HOME/.cargo/env && \
-         rustup update && \
-         rustup default stable && \
-         git clone https://github.com/aws/efs-utils && \
-         cd efs-utils && \
-         make rpm-without-system-rust && mv build/amazon-efs-utils*rpm /tmp/rpms && \
-         # clean up efs-utils folder after install
-         cd .. && rm -rf efs-utils && \
-         yum clean all; \
-    fi
+    yum -y install amazon-efs-utils --downloadonly --downloaddir=/tmp/rpms && \
+    yum clean all
 
 # Install botocore required by efs-utils for cross account mount
 RUN pip3 install --user botocore
 
 # This image is equivalent to the eks-distro-minimal-base-python image but with pip installed as well
-FROM public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base-python-builder:3.11-al23 as rpm-installer
+FROM amazonlinux:2023 as rpm-installer
+
+RUN yum -y install python3 python3-pip nfs-utils stunnel
 
 COPY --from=rpm-provider /tmp/rpms/* /tmp/download/
 
-# second param indicates to skip installing dependency rpms, these will be installed manually
-# cd, ls, cat, vim, tcpdump, are for debugging
-RUN clean_install amazon-efs-utils true && \
-    clean_install crypto-policies true && \
-    # Remove existing OpenSSL packages and install version 3.0.8 packages. Newer OpenSSL version
-    # have an updated method of enabling fips, which we do not support yet.
-    remove_package "openssl openssl-libs openssl-fips-provider-latest" && \
-    clean_install "openssl-3.0.8 openssl-libs-3.0.8 openssl-fips-provider-certified-3.0.8" true && \
-    install_binary \
-        /usr/bin/cat \
-        /usr/bin/cd \
-        /usr/bin/df \
-        /usr/bin/env \
-        /usr/bin/find \
-        /usr/bin/grep \
-        /usr/bin/ln \
-        /usr/bin/ls \
-        /usr/bin/mount \
-        /usr/bin/umount \
-        /sbin/mount.nfs4 \
-        /usr/bin/sed \
-        /usr/bin/stat \
-        /usr/bin/stunnel \
-        /usr/sbin/tcpdump \
-        /usr/bin/which && \
-    cleanup "efs-csi"
+# Install amazon-efs-utils RPM
+RUN yum -y localinstall /tmp/download/*.rpm && \
+    yum clean all
 
 # At image build time, static files installed by efs-utils in the config directory, i.e. CAs file, need
 # to be saved in another place so that the other stateful files created at runtime, i.e. private key for
 # client certificate, in the same config directory can be persisted to host with a host path volume.
 # Otherwise creating a host path volume for that directory will clean up everything inside at the first time.
 # Those static files need to be copied back to the config directory when the driver starts up.
-RUN mv /newroot/etc/amazon/efs /newroot/etc/amazon/efs-static-files
+RUN if [ -d /etc/amazon/efs ]; then mv /etc/amazon/efs /etc/amazon/efs-static-files; fi
 
-FROM public.ecr.aws/eks-distro-build-tooling/eks-distro-minimal-base-python:3.11-al23 AS linux-amazon
+FROM amazonlinux:2023 AS linux-amazon
 
-COPY --from=rpm-installer /newroot /
-COPY --from=rpm-provider /root/.local/lib/python3.11/site-packages/ /usr/lib/python3.11/site-packages/
+# Install runtime dependencies
+RUN yum -y install python3 python3-pip nfs-utils stunnel && \
+    yum clean all
 
+# Copy installed packages and files from rpm-installer
+COPY --from=rpm-installer /usr /usr
+COPY --from=rpm-installer /etc /etc
+
+# Copy botocore from rpm-provider
+COPY --from=rpm-provider /root/.local/lib/python3.*/site-packages/ /usr/lib/python3.11/site-packages/
+
+# Copy the built driver binary
 COPY --from=go-builder /go/src/github.com/kubernetes-sigs/aws-efs-csi-driver/bin/aws-efs-csi-driver /bin/aws-efs-csi-driver
 COPY THIRD-PARTY /
+
+# Create necessary directories for EFS utilities with proper permissions
+# Note: These need to be writable as the CSI driver runs as non-root in production
+RUN mkdir -p /var/log/amazon/efs && \
+    chmod 777 /var/log/amazon/efs && \
+    mkdir -p /var/run/efs && \
+    chmod 777 /var/run/efs && \
+    mkdir -p /etc/amazon/efs && \
+    chmod 755 /etc/amazon/efs && \
+    mkdir -p /var/amazon/efs && \
+    chmod 777 /var/amazon/efs && \
+    # Create default log files to ensure they exist
+    touch /var/log/amazon/efs/mount-watchdog.log && \
+    chmod 666 /var/log/amazon/efs/mount-watchdog.log && \
+    touch /var/log/amazon/efs/mount.log && \
+    chmod 666 /var/log/amazon/efs/mount.log
 
 # Create a symbolic link for stunnel5 to stunnel (for backward compatibility)
 RUN if [ -f /usr/bin/stunnel ]; then ln -s /usr/bin/stunnel /usr/bin/stunnel5; fi
 
-ENTRYPOINT ["/bin/aws-efs-csi-driver"]
+# Copy and set entrypoint script
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

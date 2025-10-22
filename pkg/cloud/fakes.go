@@ -112,3 +112,95 @@ func (c *FakeCloudProvider) ListAccessPoints(ctx context.Context, fileSystemId s
 	}
 	return accessPoints, nil
 }
+
+// FindFileSystemsByTags finds EFS file systems matching the given tags
+func (c *FakeCloudProvider) FindFileSystemsByTags(ctx context.Context, tags map[string]string) ([]*FileSystem, error) {
+	// Simple implementation for testing - returns empty slice
+	return []*FileSystem{}, nil
+}
+
+// GetFileSystemTags retrieves tags for a specific EFS file system
+func (c *FakeCloudProvider) GetFileSystemTags(ctx context.Context, fileSystemId string) (map[string]string, error) {
+	// Simple implementation for testing - returns empty tags
+	return map[string]string{}, nil
+}
+
+// CreateFileSystem creates a new EFS filesystem for namespace provisioning
+func (c *FakeCloudProvider) CreateFileSystem(ctx context.Context, clientToken string, options *FileSystemOptions) (*FileSystem, error) {
+	// Simple implementation for testing - returns a basic filesystem
+	return &FileSystem{
+		FileSystemId:    "fs-fake123456",
+		LifeCycleState:  "available",
+		PerformanceMode: options.PerformanceMode,
+		ThroughputMode:  options.ThroughputMode,
+		Encrypted:       options.Encrypted,
+		Tags:            options.Tags,
+	}, nil
+}
+
+// CreateMountTarget creates a new mount target for an EFS filesystem
+func (c *FakeCloudProvider) CreateMountTarget(ctx context.Context, fileSystemId, subnetId, securityGroupId string) (*MountTarget, error) {
+	// Simple implementation for testing - returns a basic mount target
+	return &MountTarget{
+		AZName:        "us-east-1a",
+		AZId:          "use1-az1",
+		MountTargetId: "fsmt-fake123456",
+		IPAddress:     "192.168.1.100",
+	}, nil
+}
+
+// DescribeFileSystems lists EFS filesystems with optional filtering by creation token and pagination support
+func (c *FakeCloudProvider) DescribeFileSystems(ctx context.Context, creationToken string, maxResults int32) ([]*FileSystem, string, error) {
+	var result []*FileSystem
+	for _, fs := range c.fileSystems {
+		result = append(result, fs)
+	}
+	// Simple implementation - returns all filesystems without filtering or pagination
+	return result, "", nil
+}
+
+// Additional cloud interface methods for full compatibility
+func (c *FakeCloudProvider) WaitForFileSystemAvailable(ctx context.Context, fileSystemId string) error {
+	// Simple implementation for testing - returns immediately as available
+	return nil
+}
+
+func (c *FakeCloudProvider) WaitForMountTargetsAvailable(ctx context.Context, fileSystemId string) error {
+	// Simple implementation for testing - returns immediately as available
+	return nil
+}
+
+func (c *FakeCloudProvider) DeleteFileSystem(ctx context.Context, fileSystemId string) error {
+	// Simple implementation for testing - removes the filesystem
+	delete(c.fileSystems, fileSystemId)
+	return nil
+}
+
+func (c *FakeCloudProvider) DeleteMountTarget(ctx context.Context, mountTargetId string) error {
+	// Simple implementation for testing - removes the mount target
+	for fsId, mt := range c.mountTargets {
+		if mt.MountTargetId == mountTargetId {
+			delete(c.mountTargets, fsId)
+			break
+		}
+	}
+	return nil
+}
+
+func (c *FakeCloudProvider) ListMountTargets(ctx context.Context, fileSystemId string) ([]*MountTarget, error) {
+	// Simple implementation for testing - returns mount target for filesystem if it exists
+	if mt, ok := c.mountTargets[fileSystemId]; ok {
+		return []*MountTarget{mt}, nil
+	}
+	return []*MountTarget{}, nil
+}
+
+func (c *FakeCloudProvider) GetClusterSubnets(ctx context.Context) ([]string, error) {
+	// Simple implementation for testing - returns fake subnets
+	return []string{"subnet-fake123", "subnet-fake456"}, nil
+}
+
+func (c *FakeCloudProvider) GetClusterSecurityGroup(ctx context.Context) (string, error) {
+	// Simple implementation for testing - returns fake security group
+	return "sg-fake123", nil
+}

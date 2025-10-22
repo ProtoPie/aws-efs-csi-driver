@@ -323,7 +323,7 @@ func (w *execWatchdog) runLoop(stopCh <-chan struct{}) {
 		select {
 		case <-stopCh:
 			klog.Info("stopping...")
-			break
+			return
 		default:
 			err := w.exec()
 			if err != nil {
@@ -335,6 +335,12 @@ func (w *execWatchdog) runLoop(stopCh <-chan struct{}) {
 
 func (w *execWatchdog) exec() error {
 	cmd := exec.Command(w.execCmd, w.execArg...)
+
+	// Set environment variables that might be needed by the Python script
+	cmd.Env = append(os.Environ(),
+		"PYTHONUNBUFFERED=1", // Disable Python output buffering for better error visibility
+	)
+
 	cmd.Stdout = newInfoRedirect(w.execCmd)
 	cmd.Stderr = newErrRedirect(w.execCmd)
 
@@ -343,11 +349,19 @@ func (w *execWatchdog) exec() error {
 	w.mu.Lock()
 	err := cmd.Start()
 	if err != nil {
+		w.mu.Unlock()
+		klog.Errorf("Failed to start %s: %v", w.execCmd, err)
 		return err
 	}
 	w.mu.Unlock()
 
-	return cmd.Wait()
+	err = cmd.Wait()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			klog.Errorf("%s exited with code %d", w.execCmd, exitErr.ExitCode())
+		}
+	}
+	return err
 }
 
 /*
@@ -412,7 +426,18 @@ func newErrRedirect(name string) *logRedirect {
 	}
 }
 func (l *logRedirect) Write(p []byte) (n int, err error) {
-	msg := fmt.Sprintf("%s[%s]: %s", l.processName, l.level, string(p))
-	l.logFunc("%s", msg)
-	return len(msg), nil
+	// Avoid logging empty messages
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	// Convert bytes to string and trim whitespace
+	content := strings.TrimSpace(string(p))
+	if content == "" {
+		return len(p), nil
+	}
+
+	// Log the actual content without truncation
+	l.logFunc("%s[%s]: %s", l.processName, l.level, content)
+	return len(p), nil
 }

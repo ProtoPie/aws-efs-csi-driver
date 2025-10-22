@@ -1,0 +1,89 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: efs-ns-test
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-ns-test
+mountOptions:
+- tls
+- iam
+parameters:
+  basePath: /namespace_provisioning
+  directoryPerms: "700"
+  gidRangeEnd: "2000"
+  gidRangeStart: "1000"
+  performanceThroughputMode: elastic
+  provisioningMode: efs-ns
+provisioner: efs.csi.aws.com
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-ns-test-1
+  namespace: efs-ns-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-test
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-ns-test-2
+  namespace: efs-ns-test
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-test
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efs-ns-test
+  namespace: efs-ns-test
+spec:
+  containers:
+  - name: app
+    image: busybox:latest
+    command:
+    - /bin/sh
+    - -c
+    - |
+      echo "Pod started at $(date)"
+      echo "Mounting EFS volume..."
+      while true; do
+        echo "$(date): Pod is running and keeping PVC mounted"
+        sleep 300
+      done
+    volumeMounts:
+    - name: efs-storage-1
+      mountPath: /mnt/efs-1
+    - name: efs-storage-2
+      mountPath: /mnt/efs-2
+    resources:
+      requests:
+        memory: "64Mi"
+        cpu: "50m"
+      limits:
+        memory: "128Mi"
+        cpu: "100m"
+  volumes:
+  - name: efs-storage-1
+    persistentVolumeClaim:
+      claimName: efs-ns-test-1
+  - name: efs-storage-2
+    persistentVolumeClaim:
+      claimName: efs-ns-test-2
+  restartPolicy: Always
