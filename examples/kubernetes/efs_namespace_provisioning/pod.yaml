@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: efs-ns-app
+  labels:
+    app: efs-ns-example
+spec:
+  containers:
+    - name: app
+      image: busybox:1.35
+      command: ["/bin/sh"]
+      args: ["-c", "while true; do echo $(date -u) >> /data/out.txt; sleep 5; done"]
+      volumeMounts:
+        - name: persistent-storage
+          mountPath: /data
+      resources:
+        requests:
+          memory: "64Mi"
+          cpu: "250m"
+        limits:
+          memory: "128Mi"
+          cpu: "500m"
+  volumes:
+    - name: persistent-storage
+      persistentVolumeClaim:
+        claimName: efs-ns-claim

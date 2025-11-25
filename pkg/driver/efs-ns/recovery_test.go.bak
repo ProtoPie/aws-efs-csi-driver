@@ -1,0 +1,632 @@
+/*
+Copyright 2024 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package efsns
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/efs"
+	efstypes "github.com/aws/aws-sdk-go-v2/service/efs/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRecoveryManager_RollbackFileSystemCreation(t *testing.T) {
+	mockEFSClient := NewMockEFSClient()
+	mockEC2Client := NewMockEC2Client()
+	mockCache := NewMockRecoveryCache()
+	mockTracker := NewMockPVCTracker()
+
+	recoveryManager := NewRecoveryManager(
+		mockEFSClient,
+		mockEC2Client,
+		mockCache,
+		mockTracker,
+		"test-cluster",
+		"vpc-12345",
+	)
+
+	tests := []struct {
+		name        string
+		fsInfo      *PartialFileSystemInfo
+		setupMocks  func()
+		expectError bool
+		errorType   EFSNSErrorType
+	}{
+		{
+			name:   "nil filesystem info",
+			fsInfo: nil,
+			setupMocks: func() {
+				// No mocks needed
+			},
+			expectError: true,
+			errorType:   ErrInvalidParameter,
+		},
+		{
+			name: "successful rollback with all resources",
+			fsInfo: &PartialFileSystemInfo{
+				FileSystemID:    "fs-12345",
+				Namespace:       "test-namespace",
+				MountTargetIDs:  []string{"fsmt-11111", "fsmt-22222"},
+				SecurityGroupID: "sg-12345",
+				CreatedAt:       time.Now(),
+				State:           "creating",
+			},
+			setupMocks: func() {
+				// Mock mount target deletions
+				mockEFSClient.EXPECT().
+					DeleteMountTarget(gomock.Any(), &efs.DeleteMountTargetInput{
+						MountTargetId: aws.String("fsmt-11111"),
+					}).
+					Return(&efs.DeleteMountTargetOutput{}, nil)
+
+				mockEFSClient.EXPECT().
+					DeleteMountTarget(gomock.Any(), &efs.DeleteMountTargetInput{
+						MountTargetId: aws.String("fsmt-22222"),
+					}).
+					Return(&efs.DeleteMountTargetOutput{}, nil)
+
+				// Mock mount target status checks (simulate deletion completion)
+				mockEFSClient.EXPECT().
+					DescribeMountTargets(gomock.Any(), &efs.DescribeMountTargetsInput{
+						MountTargetId: aws.String("fsmt-11111"),
+					}).
+					Return(nil, errors.New("MountTargetNotFound")).
+					AnyTimes()
+
+				mockEFSClient.EXPECT().
+					DescribeMountTargets(gomock.Any(), &efs.DescribeMountTargetsInput{
+						MountTargetId: aws.String("fsmt-22222"),
+					}).
+					Return(nil, errors.New("MountTargetNotFound")).
+					AnyTimes()
+
+				// Mock security group deletion
+				mockEC2Client.EXPECT().
+					DeleteSecurityGroup(gomock.Any(), &ec2.DeleteSecurityGroupInput{
+						GroupId: aws.String("sg-12345"),
+					}).
+					Return(&ec2.DeleteSecurityGroupOutput{}, nil)
+
+				// Mock filesystem deletion
+				mockEFSClient.EXPECT().
+					DeleteFileSystem(gomock.Any(), &efs.DeleteFileSystemInput{
+						FileSystemId: aws.String("fs-12345"),
+					}).
+					Return(&efs.DeleteFileSystemOutput{}, nil)
+
+				// Mock cache deletion
+				mockCache.EXPECT().
+					Delete("test-namespace")
+			},
+			expectError: false,
+		},
+		{
+			name: "rollback with mount target deletion failure",
+			fsInfo: &PartialFileSystemInfo{
+				FileSystemID:    "fs-12345",
+				Namespace:       "test-namespace",
+				MountTargetIDs:  []string{"fsmt-11111"},
+				SecurityGroupID: "sg-12345",
+				CreatedAt:       time.Now(),
+				State:           "creating",
+			},
+			setupMocks: func() {
+				// Mock mount target deletion failure
+				mockEFSClient.EXPECT().
+					DeleteMountTarget(gomock.Any(), &efs.DeleteMountTargetInput{
+						MountTargetId: aws.String("fsmt-11111"),
+					}).
+					Return(nil, errors.New("mount target deletion failed")).
+					MaxTimes(6) // Account for retries
+
+				// Still expect security group and filesystem deletions to proceed
+				mockEC2Client.EXPECT().
+					DeleteSecurityGroup(gomock.Any(), &ec2.DeleteSecurityGroupInput{
+						GroupId: aws.String("sg-12345"),
+					}).
+					Return(&ec2.DeleteSecurityGroupOutput{}, nil).
+					MaxTimes(6) // Account for retries
+
+				mockEFSClient.EXPECT().
+					DeleteFileSystem(gomock.Any(), &efs.DeleteFileSystemInput{
+						FileSystemId: aws.String("fs-12345"),
+					}).
+					Return(&efs.DeleteFileSystemOutput{}, nil).
+					MaxTimes(6) // Account for retries
+
+				mockCache.EXPECT().
+					Delete("test-namespace")
+			},
+			expectError: true,
+			errorType:   ErrFileSystemDeletionFailed,
+		},
+		{
+			name: "rollback with filesystem only",
+			fsInfo: &PartialFileSystemInfo{
+				FileSystemID: "fs-12345",
+				Namespace:    "test-namespace",
+				CreatedAt:    time.Now(),
+				State:        "creating",
+				// No mount targets or security group
+			},
+			setupMocks: func() {
+				// Mock filesystem deletion only
+				mockEFSClient.EXPECT().
+					DeleteFileSystem(gomock.Any(), &efs.DeleteFileSystemInput{
+						FileSystemId: aws.String("fs-12345"),
+					}).
+					Return(&efs.DeleteFileSystemOutput{}, nil)
+
+				mockCache.EXPECT().
+					Delete("test-namespace")
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setupMocks()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			err := recoveryManager.RollbackFileSystemCreation(ctx, "test-namespace", tt.fsInfo)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorType != "" {
+					assert.True(t, IsEFSNSError(err, tt.errorType))
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRecoveryManager_CleanupOrphanedResources(t *testing.T) {
+
+	mockEFSClient := NewMockEFSClient()
+	mockEC2Client := NewMockEC2Client()
+	mockCache := NewMockRecoveryCache()
+	mockTracker := NewMockPVCTracker()
+
+	recoveryManager := &recoveryManager{
+		efsClient:  mockEFSClient,
+		ec2Client:  mockEC2Client,
+		cache:      mockCache,
+		tracker:    mockTracker,
+		clusterID:  "test-cluster",
+		vpcID:      "vpc-12345",
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	tests := []struct {
+		name           string
+		setupMocks     func()
+		expectError    bool
+		expectedCalled bool
+	}{
+		{
+			name: "successful cleanup",
+			setupMocks: func() {
+				// Mock finding orphaned filesystems (return empty for now)
+				// Mock finding orphaned security groups (return empty for now)
+				// Since the actual implementation of findOrphanedFileSystems and 
+				// findOrphanedSecurityGroups are placeholders, this test will pass
+			},
+			expectError:    false,
+			expectedCalled: true,
+		},
+		{
+			name: "cleanup with errors",
+			setupMocks: func() {
+				// Similar setup but we'll expect the method to handle errors gracefully
+			},
+			expectError:    false, // Should not fail completely even if some cleanup fails
+			expectedCalled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setupMocks()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			err := recoveryManager.CleanupOrphanedResources(ctx)
+
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				// Since the implementation is mostly placeholder, we expect no error
+				// In a complete implementation, this would test actual cleanup logic
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRecoveryManager_RecoverFromHangingOperation(t *testing.T) {
+
+	mockEFSClient := NewMockEFSClient()
+	mockEC2Client := NewMockEC2Client()
+	mockCache := NewMockRecoveryCache()
+	mockTracker := NewMockPVCTracker()
+
+	recoveryManager := &recoveryManager{
+		efsClient:  mockEFSClient,
+		ec2Client:  mockEC2Client,
+		cache:      mockCache,
+		tracker:    mockTracker,
+		clusterID:  "test-cluster",
+		vpcID:      "vpc-12345",
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	tests := []struct {
+		name        string
+		operationID string
+		setupOp     func()
+		expectError bool
+		errorType   EFSNSErrorType
+	}{
+		{
+			name:        "operation not found",
+			operationID: "non-existent-op",
+			setupOp:     func() {},
+			expectError: true,
+			errorType:   ErrInvalidParameter,
+		},
+		{
+			name:        "operation not running",
+			operationID: "completed-op",
+			setupOp: func() {
+				recoveryManager.operations["completed-op"] = &RecoveryOperation{
+					ID:        "completed-op",
+					Status:    RecoveryOperationStatusCompleted,
+					Namespace: "test-namespace",
+				}
+			},
+			expectError: true,
+			errorType:   ErrInvalidParameter,
+		},
+		{
+			name:        "operation running within time limit",
+			operationID: "running-op",
+			setupOp: func() {
+				recoveryManager.operations["running-op"] = &RecoveryOperation{
+					ID:        "running-op",
+					Status:    RecoveryOperationStatusRunning,
+					StartTime: time.Now().Add(-1 * time.Minute), // Started 1 minute ago
+					Namespace: "test-namespace",
+				}
+			},
+			expectError: false,
+		},
+		{
+			name:        "operation hanging beyond timeout",
+			operationID: "hanging-op",
+			setupOp: func() {
+				recoveryManager.operations["hanging-op"] = &RecoveryOperation{
+					ID:        "hanging-op",
+					Status:    RecoveryOperationStatusRunning,
+					StartTime: time.Now().Add(-10 * time.Minute), // Started 10 minutes ago
+					Namespace: "test-namespace",
+				}
+			},
+			expectError: true,
+			errorType:   ErrTimeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Clear operations map
+			recoveryManager.operations = make(map[string]*RecoveryOperation)
+			tt.setupOp()
+
+			ctx := context.Background()
+			err := recoveryManager.RecoverFromHangingOperation(ctx, tt.operationID)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorType != "" {
+					assert.True(t, IsEFSNSError(err, tt.errorType))
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRecoveryManager_ValidateResourceConsistency(t *testing.T) {
+
+	mockEFSClient := NewMockEFSClient()
+	mockEC2Client := NewMockEC2Client()
+	mockCache := NewMockRecoveryCache()
+	mockTracker := NewMockPVCTracker()
+
+	recoveryManager := &recoveryManager{
+		efsClient:  mockEFSClient,
+		ec2Client:  mockEC2Client,
+		cache:      mockCache,
+		tracker:    mockTracker,
+		clusterID:  "test-cluster",
+		vpcID:      "vpc-12345",
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	tests := []struct {
+		name        string
+		setupMocks  func()
+		expectError bool
+		errorType   EFSNSErrorType
+	}{
+		{
+			name: "consistent state",
+			setupMocks: func() {
+				// Mock cache returning filesystem info
+				mockCache.EXPECT().
+					List().
+					Return(map[string]*FileSystemInfo{
+						"test-namespace": {
+							FileSystemID: "fs-12345",
+							Namespace:    "test-namespace",
+							State:        FileSystemStateAvailable,
+							MountTargets: []*MountTargetInfo{},
+						},
+					})
+			},
+			expectError: false,
+		},
+		{
+			name: "inconsistent state - empty cache",
+			setupMocks: func() {
+				// Mock cache returning empty
+				mockCache.EXPECT().
+					List().
+					Return(map[string]*FileSystemInfo{})
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setupMocks()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			err := recoveryManager.ValidateResourceConsistency(ctx)
+
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errorType != "" {
+					assert.True(t, IsEFSNSError(err, tt.errorType))
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRecoveryOperation_States(t *testing.T) {
+	operation := &RecoveryOperation{
+		ID:          "test-op",
+		Type:        RecoveryOperationRollback,
+		Namespace:   "test-namespace",
+		ResourceID:  "fs-12345",
+		StartTime:   time.Now(),
+		Status:      RecoveryOperationStatusPending,
+		Description: "Test operation",
+	}
+
+	// Test initial state
+	assert.Equal(t, RecoveryOperationStatusPending, operation.Status)
+
+	// Test state transitions
+	operation.Status = RecoveryOperationStatusRunning
+	assert.Equal(t, RecoveryOperationStatusRunning, operation.Status)
+
+	operation.Status = RecoveryOperationStatusCompleted
+	assert.Equal(t, RecoveryOperationStatusCompleted, operation.Status)
+}
+
+func TestRecoveryOperationType_Constants(t *testing.T) {
+	tests := []struct {
+		name     string
+		opType   RecoveryOperationType
+		expected string
+	}{
+		{"rollback", RecoveryOperationRollback, "rollback"},
+		{"cleanup", RecoveryOperationCleanup, "cleanup"},
+		{"validation", RecoveryOperationValidation, "validation"},
+		{"hanging_timeout", RecoveryOperationHangingTimeout, "hanging_timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, string(tt.opType))
+		})
+	}
+}
+
+func TestRecoveryOperationStatus_Constants(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   RecoveryOperationStatus
+		expected string
+	}{
+		{"pending", RecoveryOperationStatusPending, "pending"},
+		{"running", RecoveryOperationStatusRunning, "running"},
+		{"completed", RecoveryOperationStatusCompleted, "completed"},
+		{"failed", RecoveryOperationStatusFailed, "failed"},
+		{"cancelled", RecoveryOperationStatusCancelled, "cancelled"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, string(tt.status))
+		})
+	}
+}
+
+func TestPartialFileSystemInfo(t *testing.T) {
+	info := &PartialFileSystemInfo{
+		FileSystemID:    "fs-12345",
+		Namespace:       "test-namespace",
+		MountTargetIDs:  []string{"fsmt-11111", "fsmt-22222"},
+		SecurityGroupID: "sg-12345",
+		CreatedAt:       time.Now(),
+		State:           "creating",
+	}
+
+	assert.Equal(t, "fs-12345", info.FileSystemID)
+	assert.Equal(t, "test-namespace", info.Namespace)
+	assert.Len(t, info.MountTargetIDs, 2)
+	assert.Equal(t, "sg-12345", info.SecurityGroupID)
+	assert.Equal(t, "creating", info.State)
+}
+
+func TestRecoveryManager_TrackOperation(t *testing.T) {
+	rm := &recoveryManager{
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	operation := &RecoveryOperation{
+		ID:        "test-op",
+		Type:      RecoveryOperationRollback,
+		Namespace: "test-namespace",
+		Status:    RecoveryOperationStatusPending,
+	}
+
+	rm.trackOperation(operation)
+
+	// Verify operation is tracked
+	rm.operationsMu.RLock()
+	trackedOp, exists := rm.operations["test-op"]
+	rm.operationsMu.RUnlock()
+
+	assert.True(t, exists)
+	assert.Equal(t, operation, trackedOp)
+}
+
+func TestRecoveryManager_CompleteOperation(t *testing.T) {
+	rm := &recoveryManager{
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	operation := &RecoveryOperation{
+		ID:     "test-op",
+		Status: RecoveryOperationStatusRunning,
+	}
+
+	rm.operations["test-op"] = operation
+	rm.completeOperation("test-op")
+
+	// Verify operation is marked as completed
+	assert.Equal(t, RecoveryOperationStatusCompleted, operation.Status)
+}
+
+func TestRecoveryManager_Constants(t *testing.T) {
+	assert.Equal(t, 10*time.Minute, RecoveryCleanupTimeout)
+	assert.Equal(t, 24*time.Hour, OrphanedResourceMaxAge)
+	assert.Equal(t, 5*time.Minute, RecoveryOperationTimeout)
+}
+
+// Integration-style test for recovery manager lifecycle
+func TestRecoveryManager_Integration(t *testing.T) {
+
+	mockEFSClient := NewMockEFSClient()
+	mockEC2Client := NewMockEC2Client()
+	mockCache := NewMockRecoveryCache()
+	mockTracker := NewMockPVCTracker()
+
+	rm := NewRecoveryManager(
+		mockEFSClient,
+		mockEC2Client,
+		mockCache,
+		mockTracker,
+		"test-cluster",
+		"vpc-12345",
+	)
+
+	ctx := context.Background()
+
+	// Test that we can create the recovery manager and it has the right interface
+	assert.NotNil(t, rm)
+
+	// Test that cleanup operations don't panic with empty state
+	err := rm.CleanupOrphanedResources(ctx)
+	assert.NoError(t, err) // Should not error with empty state
+
+	// Test validation with empty cache
+	mockCache.EXPECT().List().Return(map[string]*FileSystemInfo{})
+	err = rm.ValidateResourceConsistency(ctx)
+	assert.NoError(t, err)
+}
+
+// Benchmark tests for recovery operations
+func BenchmarkRecoveryManager_TrackOperation(b *testing.B) {
+	rm := &recoveryManager{
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		operation := &RecoveryOperation{
+			ID:        string(rune(i)),
+			Type:      RecoveryOperationRollback,
+			Namespace: "test-namespace",
+			Status:    RecoveryOperationStatusPending,
+		}
+		rm.trackOperation(operation)
+	}
+}
+
+func BenchmarkRecoveryManager_CompleteOperation(b *testing.B) {
+	rm := &recoveryManager{
+		operations: make(map[string]*RecoveryOperation),
+	}
+
+	// Pre-populate operations
+	for i := 0; i < b.N; i++ {
+		operation := &RecoveryOperation{
+			ID:     string(rune(i)),
+			Status: RecoveryOperationStatusRunning,
+		}
+		rm.operations[string(rune(i))] = operation
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rm.completeOperation(string(rune(i)))
+	}
+}

@@ -1,0 +1,109 @@
+---
+# Namespace for team-a
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    team: team-a
+    
+---
+# Namespace for team-b  
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b
+  labels:
+    team: team-b
+
+---
+# PVC for team-a (will create dedicated EFS filesystem)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: team-a-data
+  namespace: team-a
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-sc
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# PVC for team-b (will create separate dedicated EFS filesystem) 
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: team-b-data
+  namespace: team-b
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-sc
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Pod in team-a namespace
+apiVersion: v1
+kind: Pod
+metadata:
+  name: team-a-app
+  namespace: team-a
+  labels:
+    app: team-a-app
+spec:
+  containers:
+    - name: app
+      image: busybox:1.35
+      command: ["/bin/sh"]
+      args: 
+        - "-c"
+        - |
+          echo "Team A data - $(date)" > /data/team-a.txt
+          echo "This data is isolated to team-a namespace" >> /data/team-a.txt
+          while true; do 
+            echo "$(date): Team A is running" >> /data/activity.log
+            sleep 30
+          done
+      volumeMounts:
+        - name: team-data
+          mountPath: /data
+  volumes:
+    - name: team-data
+      persistentVolumeClaim:
+        claimName: team-a-data
+
+---
+# Pod in team-b namespace
+apiVersion: v1
+kind: Pod
+metadata:
+  name: team-b-app
+  namespace: team-b
+  labels:
+    app: team-b-app
+spec:
+  containers:
+    - name: app
+      image: busybox:1.35
+      command: ["/bin/sh"]
+      args:
+        - "-c"
+        - |
+          echo "Team B data - $(date)" > /data/team-b.txt
+          echo "This data is isolated to team-b namespace" >> /data/team-b.txt
+          while true; do
+            echo "$(date): Team B is running" >> /data/activity.log
+            sleep 30
+          done
+      volumeMounts:
+        - name: team-data
+          mountPath: /data
+  volumes:
+    - name: team-data
+      persistentVolumeClaim:
+        claimName: team-b-data

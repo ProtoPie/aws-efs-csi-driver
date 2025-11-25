@@ -1,0 +1,41 @@
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: efs-ns-sc
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: efs.csi.aws.com
+parameters:
+  # efs-ns provisioning mode creates a dedicated EFS filesystem per namespace
+  provisioningMode: efs-ns
+  
+  # EFS filesystem configuration
+  performanceMode: generalPurpose    # generalPurpose or maxIO
+  throughputMode: bursting          # bursting or provisioned
+  # provisionedThroughputInMibps: "1000"  # Required if throughputMode is provisioned
+  
+  # Encryption settings
+  encrypted: "true"                 # Enable encryption at rest
+  # kmsKeyId: "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"  # Optional KMS key
+  encryptInTransit: "true"          # Enable encryption in transit via TLS
+  
+  # Optional tags to apply to the EFS filesystem
+  tags: |
+    {
+      "Environment": "production",
+      "Team": "platform",
+      "CostCenter": "engineering"
+    }
+
+# Reclaim policy determines what happens when PVC is deleted
+reclaimPolicy: Delete
+
+# Volume binding mode
+volumeBindingMode: Immediate
+
+# Allow volume expansion
+allowVolumeExpansion: true
+
+# Supported access modes
+mountOptions:
+  - tls  # Enable TLS encryption in transit

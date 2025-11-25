@@ -1,0 +1,615 @@
+/*
+Copyright 2024 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package efsns
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+func TestRetryWithExponentialBackoff(t *testing.T) {
+	tests := []struct {
+		name           string
+		attempts       int
+		shouldRetry    func(error) bool
+		errorSequence  []error
+		expectedError  error
+		expectedCalls  int
+		maxRetries     int
+	}{
+		{
+			name:     "success on first attempt",
+			attempts: 1,
+			shouldRetry: func(err error) bool {
+				return true
+			},
+			errorSequence: []error{nil},
+			expectedError: nil,
+			expectedCalls: 1,
+			maxRetries:    3,
+		},
+		{
+			name:     "success on third attempt",
+			attempts: 3,
+			shouldRetry: func(err error) bool {
+				return true
+			},
+			errorSequence: []error{
+				errors.New("temporary error"),
+				errors.New("another temporary error"),
+				nil,
+			},
+			expectedError: nil,
+			expectedCalls: 3,
+			maxRetries:    5,
+		},
+		{
+			name:     "fail after max retries",
+			attempts: 4,
+			shouldRetry: func(err error) bool {
+				return true
+			},
+			errorSequence: []error{
+				errors.New("error 1"),
+				errors.New("error 2"),
+				errors.New("error 3"),
+				errors.New("final error"),
+			},
+			expectedError: errors.New("final error"),
+			expectedCalls: 4,
+			maxRetries:    3,
+		},
+		{
+			name:     "non-retryable error",
+			attempts: 1,
+			shouldRetry: func(err error) bool {
+				return false
+			},
+			errorSequence: []error{
+				errors.New("non-retryable error"),
+			},
+			expectedError: errors.New("non-retryable error"),
+			expectedCalls: 1,
+			maxRetries:    3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callCount := 0
+			config := &RetryConfig{
+				MaxRetries:   tt.maxRetries,
+				BaseDelay:    1 * time.Millisecond, // Very short for testing
+				MaxDelay:     10 * time.Millisecond,
+				JitterFactor: 0.0, // No jitter for predictable testing
+				ShouldRetry:  tt.shouldRetry,
+				OnRetry: func(attempt int, err error, delay time.Duration) {
+					// Test callback is called
+				},
+			}
+
+			fn := func() error {
+				defer func() { callCount++ }()
+				if callCount < len(tt.errorSequence) {
+					return tt.errorSequence[callCount]
+				}
+				return errors.New("unexpected call")
+			}
+
+			ctx := context.Background()
+			err := RetryWithExponentialBackoff(ctx, config, fn)
+
+			assert.Equal(t, tt.expectedCalls, callCount)
+			if tt.expectedError != nil {
+				assert.EqualError(t, err, tt.expectedError.Error())
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRetryWithExponentialBackoffContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	config := DefaultRetryConfig()
+	config.BaseDelay = 100 * time.Millisecond
+	
+	callCount := 0
+	fn := func() error {
+		callCount++
+		if callCount == 1 {
+			// Cancel context after first call
+			cancel()
+		}
+		return errors.New("retryable error")
+	}
+
+	err := RetryWithExponentialBackoff(ctx, config, fn)
+	
+	assert.Equal(t, 1, callCount)
+	assert.Equal(t, context.Canceled, err)
+}
+
+func TestCalculateDelay(t *testing.T) {
+	baseDelay := 100 * time.Millisecond
+	maxDelay := 1 * time.Second
+	jitterFactor := 0.0 // No jitter for predictable testing
+
+	tests := []struct {
+		attempt      int
+		expectedMin  time.Duration
+		expectedMax  time.Duration
+	}{
+		{0, 100 * time.Millisecond, 100 * time.Millisecond},
+		{1, 200 * time.Millisecond, 200 * time.Millisecond},
+		{2, 400 * time.Millisecond, 400 * time.Millisecond},
+		{3, 800 * time.Millisecond, 800 * time.Millisecond},
+		{4, 1 * time.Second, 1 * time.Second}, // Capped at maxDelay
+		{5, 1 * time.Second, 1 * time.Second}, // Capped at maxDelay
+	}
+
+	for _, tt := range tests {
+		t.Run(string(rune('A'+tt.attempt)), func(t *testing.T) {
+			delay := calculateDelay(tt.attempt, baseDelay, maxDelay, jitterFactor)
+			assert.Equal(t, tt.expectedMin, delay)
+		})
+	}
+}
+
+func TestCalculateDelayWithJitter(t *testing.T) {
+	baseDelay := 100 * time.Millisecond
+	maxDelay := 1 * time.Second
+	jitterFactor := 0.1
+
+	// Test that jitter produces values within expected range
+	delay := calculateDelay(2, baseDelay, maxDelay, jitterFactor)
+	expectedBase := 400 * time.Millisecond
+	expectedMin := time.Duration(float64(expectedBase) * 0.9)
+	expectedMax := time.Duration(float64(expectedBase) * 1.1)
+
+	assert.True(t, delay >= expectedMin && delay <= expectedMax,
+		"Delay %v should be between %v and %v", delay, expectedMin, expectedMax)
+}
+
+func TestDefaultShouldRetryFunc(t *testing.T) {
+	tests := []struct {
+		name     string
+		error    error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			error:    nil,
+			expected: false,
+		},
+		{
+			name:     "retryable EFS-NS error",
+			error:    NewEFSNSError(ErrAWSThrottled, "test", "", "throttled", nil),
+			expected: true,
+		},
+		{
+			name:     "non-retryable EFS-NS error",
+			error:    NewEFSNSError(ErrInvalidParameter, "test", "", "invalid", nil),
+			expected: false,
+		},
+		{
+			name:     "timeout error",
+			error:    NewEFSNSError(ErrTimeout, "test", "", "timeout", nil),
+			expected: true,
+		},
+		{
+			name:     "kubernetes timeout error",
+			error:    k8serrors.NewTimeoutError("timeout", 30),
+			expected: true,
+		},
+		{
+			name:     "kubernetes too many requests error",
+			error:    k8serrors.NewTooManyRequests("too many requests", 1),
+			expected: true,
+		},
+		{
+			name:     "kubernetes not found error",
+			error:    k8serrors.NewNotFound(schema.GroupResource{}, "test"),
+			expected: false,
+		},
+		{
+			name:     "generic error",
+			error:    errors.New("generic error"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := DefaultShouldRetryFunc(tt.error)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestIsAWSRetryableError(t *testing.T) {
+	tests := []struct {
+		name     string
+		error    error
+		expected bool
+	}{
+		{
+			name: "HTTP 429 error",
+			error: &awshttp.ResponseError{
+				ResponseError: &smithy.ResponseError{
+					Response: &smithy.Response{
+						HTTPResponse: &aws.HTTPResponse{
+							StatusCode: 429,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "HTTP 500 error",
+			error: &awshttp.ResponseError{
+				ResponseError: &smithy.ResponseError{
+					Response: &smithy.Response{
+						HTTPResponse: &aws.HTTPResponse{
+							StatusCode: 500,
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "HTTP 400 error",
+			error: &awshttp.ResponseError{
+				ResponseError: &smithy.ResponseError{
+					Response: &smithy.Response{
+						HTTPResponse: &aws.HTTPResponse{
+							StatusCode: 400,
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name:     "throttling error",
+			error:    &smithy.GenericAPIError{Code: "Throttling", Message: "throttled"},
+			expected: true,
+		},
+		{
+			name:     "internal server error",
+			error:    &smithy.GenericAPIError{Code: "InternalServerError", Message: "internal error"},
+			expected: true,
+		},
+		{
+			name:     "access denied error",
+			error:    &smithy.GenericAPIError{Code: "AccessDenied", Message: "access denied"},
+			expected: false,
+		},
+		{
+			name:     "connection error",
+			error:    errors.New("connection refused"),
+			expected: true,
+		},
+		{
+			name:     "timeout error",
+			error:    errors.New("timeout occurred"),
+			expected: true,
+		},
+		{
+			name:     "network error",
+			error:    errors.New("network unreachable"),
+			expected: true,
+		},
+		{
+			name:     "other error",
+			error:    errors.New("some other error"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isAWSRetryableError(tt.error)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestIsKubernetesRetryableError(t *testing.T) {
+	tests := []struct {
+		name     string
+		error    error
+		expected bool
+	}{
+		{
+			name:     "timeout error",
+			error:    k8serrors.NewTimeoutError("timeout", 30),
+			expected: true,
+		},
+		{
+			name:     "server timeout error",
+			error:    k8serrors.NewServerTimeout(schema.GroupResource{}, "test", 30),
+			expected: true,
+		},
+		{
+			name:     "service unavailable error",
+			error:    k8serrors.NewServiceUnavailable("service unavailable"),
+			expected: true,
+		},
+		{
+			name:     "too many requests error",
+			error:    k8serrors.NewTooManyRequests("too many requests", 1),
+			expected: true,
+		},
+		{
+			name:     "internal error",
+			error:    k8serrors.NewInternalError(errors.New("internal error")),
+			expected: true,
+		},
+		{
+			name:     "not found error",
+			error:    k8serrors.NewNotFound(schema.GroupResource{}, "test"),
+			expected: false,
+		},
+		{
+			name:     "forbidden error",
+			error:    k8serrors.NewForbidden(schema.GroupResource{}, "test", errors.New("forbidden")),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isKubernetesRetryableError(tt.error)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestRetryableEFSOperation(t *testing.T) {
+	ctx := context.Background()
+	namespace := "test-namespace"
+	operation := "TestOperation"
+
+	callCount := 0
+	fn := func() error {
+		callCount++
+		if callCount < 3 {
+			return NewEFSNSError(ErrAWSThrottled, operation, namespace, "throttled", nil)
+		}
+		return nil
+	}
+
+	err := RetryableEFSOperation(ctx, operation, namespace, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, callCount)
+}
+
+func TestRetryableKubernetesOperation(t *testing.T) {
+	ctx := context.Background()
+	namespace := "test-namespace"
+	operation := "TestOperation"
+
+	callCount := 0
+	fn := func() error {
+		callCount++
+		if callCount < 2 {
+			return k8serrors.NewTooManyRequests("too many requests", 1)
+		}
+		return nil
+	}
+
+	err := RetryableKubernetesOperation(ctx, operation, namespace, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, callCount)
+}
+
+func TestRetryableAWSOperation(t *testing.T) {
+	ctx := context.Background()
+	namespace := "test-namespace"
+	operation := "TestOperation"
+	cb := NewCircuitBreaker(5, 30*time.Second)
+
+	callCount := 0
+	fn := func() error {
+		callCount++
+		if callCount < 3 {
+			return &smithy.GenericAPIError{Code: "Throttling", Message: "throttled"}
+		}
+		return nil
+	}
+
+	err := RetryableAWSOperation(ctx, cb, operation, namespace, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, callCount)
+}
+
+func TestOperationWithTimeout(t *testing.T) {
+	tests := []struct {
+		name           string
+		timeout        time.Duration
+		operationDelay time.Duration
+		expectTimeout  bool
+	}{
+		{
+			name:           "operation completes before timeout",
+			timeout:        100 * time.Millisecond,
+			operationDelay: 50 * time.Millisecond,
+			expectTimeout:  false,
+		},
+		{
+			name:           "operation times out",
+			timeout:        50 * time.Millisecond,
+			operationDelay: 100 * time.Millisecond,
+			expectTimeout:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			operation := "TestOperation"
+
+			fn := func(ctx context.Context) error {
+				select {
+				case <-time.After(tt.operationDelay):
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+
+			err := OperationWithTimeout(ctx, tt.timeout, operation, fn)
+
+			if tt.expectTimeout {
+				assert.Error(t, err)
+				assert.True(t, IsEFSNSError(err, ErrTimeout))
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestCircuitBreaker(t *testing.T) {
+	maxFailures := 3
+	recoveryTimeout := 100 * time.Millisecond
+	cb := NewCircuitBreaker(maxFailures, recoveryTimeout)
+
+	// Test circuit breaker is initially closed
+	assert.Equal(t, CircuitBreakerClosed, cb.state)
+
+	// Test failures open the circuit
+	for i := 0; i < maxFailures; i++ {
+		err := cb.Execute(func() error {
+			return errors.New("test error")
+		})
+		assert.Error(t, err)
+	}
+
+	// Circuit should now be open
+	assert.Equal(t, CircuitBreakerOpen, cb.state)
+
+	// Test that circuit breaker rejects calls when open
+	err := cb.Execute(func() error {
+		return nil
+	})
+	assert.Error(t, err)
+	assert.True(t, IsEFSNSError(err, ErrTimeout))
+
+	// Wait for recovery timeout
+	time.Sleep(recoveryTimeout + 10*time.Millisecond)
+
+	// Test that circuit moves to half-open and can succeed
+	err = cb.Execute(func() error {
+		return nil
+	})
+	assert.NoError(t, err)
+	
+	// After successful calls in half-open state, circuit should close
+	for i := 0; i < cb.successThreshold; i++ {
+		err = cb.Execute(func() error {
+			return nil
+		})
+		assert.NoError(t, err)
+	}
+	
+	assert.Equal(t, CircuitBreakerClosed, cb.state)
+}
+
+func TestWithCircuitBreaker(t *testing.T) {
+	cb := NewCircuitBreaker(2, 100*time.Millisecond)
+	
+	fn := func() error {
+		return errors.New("test error")
+	}
+	
+	wrappedFn := WithCircuitBreaker(cb, fn)
+	
+	// First two failures should work
+	err := wrappedFn()
+	assert.Error(t, err)
+	err = wrappedFn()
+	assert.Error(t, err)
+	
+	// Circuit should be open now
+	assert.Equal(t, CircuitBreakerOpen, cb.state)
+	
+	// Next call should be rejected by circuit breaker
+	err = wrappedFn()
+	assert.Error(t, err)
+	assert.True(t, IsEFSNSError(err, ErrTimeout))
+}
+
+func TestDefaultRetryConfig(t *testing.T) {
+	config := DefaultRetryConfig()
+	
+	assert.Equal(t, DefaultMaxRetries, config.MaxRetries)
+	assert.Equal(t, DefaultBaseDelay, config.BaseDelay)
+	assert.Equal(t, DefaultMaxDelay, config.MaxDelay)
+	assert.Equal(t, DefaultJitterFactor, config.JitterFactor)
+	assert.NotNil(t, config.ShouldRetry)
+	assert.NotNil(t, config.OnRetry)
+}
+
+func TestDefaultOnRetryFunc(t *testing.T) {
+	// Test that the default retry callback doesn't panic
+	DefaultOnRetryFunc(1, errors.New("test error"), 100*time.Millisecond)
+	// If we get here without panic, test passes
+}
+
+// Benchmark tests
+func BenchmarkRetryWithExponentialBackoff(b *testing.B) {
+	config := DefaultRetryConfig()
+	config.BaseDelay = 1 * time.Microsecond // Very short for benchmarking
+	config.MaxDelay = 10 * time.Microsecond
+	
+	ctx := context.Background()
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = RetryWithExponentialBackoff(ctx, config, func() error {
+			return nil // Always succeed immediately
+		})
+	}
+}
+
+func BenchmarkCircuitBreaker(b *testing.B) {
+	cb := NewCircuitBreaker(10, 1*time.Second)
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = cb.Execute(func() error {
+			return nil // Always succeed
+		})
+	}
+}

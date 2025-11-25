@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-ns-claim
+  labels:
+    app: efs-ns-example
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-ns-sc
+  resources:
+    requests:
+      # Storage size is not used for EFS, but required by Kubernetes
+      storage: 5Gi

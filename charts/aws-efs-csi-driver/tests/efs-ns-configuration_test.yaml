@@ -1,0 +1,148 @@
+# Helm chart test to validate efs-ns configuration
+suite: EFS Namespace Configuration Tests
+templates:
+  - templates/controller-serviceaccount.yaml
+  - templates/controller-deployment.yaml
+  - templates/values.yaml
+
+tests:
+  # Test default efs-ns configuration (disabled)
+  - it: should have efs-ns disabled by default
+    template: templates/controller-deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--enable-efs-ns-mode=true"
+
+  # Test efs-ns mode enabled configuration
+  - it: should enable efs-ns mode when configured
+    template: templates/controller-deployment.yaml
+    set:
+      controller.efsNs.enabled: true
+      controller.efsNs.clusterId: "test-cluster"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--enable-efs-ns-mode=true"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--cluster-id=test-cluster"
+
+  # Test efs-ns RBAC permissions when enabled
+  - it: should add efs-ns RBAC permissions when enabled
+    template: templates/controller-serviceaccount.yaml
+    set:
+      controller.efsNs.enabled: true
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["namespaces"]
+            verbs: ["get", "list", "watch", "update", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims/finalizers"]
+            verbs: ["update", "patch"]
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["namespaces/finalizers"]
+            verbs: ["update", "patch"]
+
+  # Test efs-ns RBAC permissions when disabled
+  - it: should not add efs-ns RBAC permissions when disabled
+    template: templates/controller-serviceaccount.yaml
+    set:
+      controller.efsNs.enabled: false
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Test all efs-ns configuration parameters
+  - it: should set all efs-ns configuration parameters
+    template: templates/controller-deployment.yaml
+    set:
+      controller.efsNs.enabled: true
+      controller.efsNs.clusterId: "test-cluster"
+      controller.efsNs.cacheTTL: 600
+      controller.efsNs.pvcTrackerConfigMapName: "custom-tracker"
+      controller.efsNs.filesystemCreationTimeout: 900
+      controller.efsNs.mountTargetCreationTimeout: 450
+      controller.efsNs.defaultTags:
+        environment: test
+        team: platform
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--enable-efs-ns-mode=true"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--cluster-id=test-cluster"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--cache-ttl=600s"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--pvc-tracker-configmap-name=custom-tracker"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--filesystem-creation-timeout=900s"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--mount-target-creation-timeout=450s"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--efs-ns-default-tags=environment=test,team=platform"
+
+  # Test partial configuration
+  - it: should handle partial efs-ns configuration
+    template: templates/controller-deployment.yaml
+    set:
+      controller.efsNs.enabled: true
+      # clusterId not set
+      controller.efsNs.cacheTTL: 300
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--enable-efs-ns-mode=true"
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--cache-ttl=300s"
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--cluster-id="
+
+  # Test ServiceAccount name consistency
+  - it: should use consistent service account names
+    template: templates/controller-serviceaccount.yaml
+    set:
+      controller.serviceAccount.name: "custom-sa"
+    asserts:
+      - equal:
+          path: metadata.name
+          value: "custom-sa"
+
+  # Test namespace field in RoleBinding
+  - it: should use correct namespace in RoleBinding
+    template: templates/controller-serviceaccount.yaml
+    release:
+      namespace: kube-system
+    asserts:
+      - equal:
+          path: subjects[0].namespace
+          value: "kube-system"
+        documentIndex: 3  # RoleBinding document

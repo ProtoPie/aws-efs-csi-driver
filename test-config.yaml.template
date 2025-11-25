@@ -1,0 +1,175 @@
+# EFS Namespace Integration Test Configuration Template
+# Copy this file to test-config.yaml and customize for your environment
+
+# AWS Configuration
+aws:
+  region: us-west-2
+  profile: default  # Optional: AWS profile to use
+  efs_filesystem_id: ""  # Optional: Use existing EFS filesystem
+  create_efs_filesystem: true  # Create temporary EFS filesystem for testing
+  cleanup_efs_filesystem: true  # Cleanup EFS filesystem after testing
+
+# Kubernetes Configuration
+kubernetes:
+  kubeconfig_path: "~/.kube/config"
+  context: ""  # Optional: specific context to use
+  cluster_name: ""  # Optional: EKS cluster name for testing
+  namespace_prefix: "efs-ns-test"  # Prefix for test namespaces
+
+# Test Execution Configuration
+execution:
+  # Test suite selection (leave empty to run all)
+  test_suites:
+    - system
+    - performance
+    - security
+    - reliability
+    - monitoring
+    - compliance
+
+  # Test execution parameters
+  timeout: 3600  # Test timeout in seconds (default: 1 hour)
+  parallel_tests: 4  # Number of parallel test processes
+  verbose: false  # Enable verbose test output
+  fail_fast: false  # Stop on first test failure
+  
+  # Resource limits
+  max_test_namespaces: 20  # Maximum number of test namespaces
+  max_test_pvcs: 50  # Maximum number of test PVCs
+  
+  # Cleanup configuration
+  cleanup_on_success: true  # Cleanup resources after successful tests
+  cleanup_on_failure: false  # Keep resources for debugging on failure
+  force_cleanup: false  # Force cleanup of stuck resources
+
+# Test Data Configuration
+test_data:
+  # Performance test parameters
+  performance:
+    filesystem_creation_timeout: 30  # Seconds
+    pvc_lifecycle_timeout: 120  # Seconds
+    concurrent_operations: 10  # Number of concurrent operations to test
+    data_size_mb: 100  # Size of test data in MB
+
+  # Security test parameters
+  security:
+    encryption_in_transit: true
+    encryption_at_rest: true
+    compliance_frameworks:
+      - pci_dss
+      - hipaa
+      - soc2
+    vulnerability_scan: true
+
+  # Reliability test parameters
+  reliability:
+    chaos_scenarios:
+      - node_failure
+      - network_partition
+      - storage_failure
+      - high_load
+    recovery_timeout: 300  # Seconds to wait for recovery
+    availability_target: 99.9  # Target availability percentage
+
+  # Resource monitoring parameters
+  monitoring:
+    memory_leak_threshold_mb: 100  # Memory leak detection threshold
+    orphaned_resource_check: true
+    resource_cleanup_validation: true
+    monitoring_duration: 600  # Seconds to monitor resources
+
+# Reporting Configuration
+reporting:
+  output_directory: "./test-reports"
+  generate_html_report: true
+  include_logs: true
+  compress_reports: false
+  retention_days: 30
+
+  # Metrics collection
+  collect_metrics:
+    kubernetes: true
+    aws: true
+    performance: true
+    resource_usage: true
+
+  # Report formats
+  formats:
+    - json
+    - junit
+    - html
+
+# Notification Configuration (optional)
+notifications:
+  enabled: false
+  
+  # Slack notification (if enabled)
+  slack:
+    webhook_url: ""
+    channel: "#efs-testing"
+    notify_on_failure: true
+    notify_on_success: false
+
+  # Email notification (if enabled)
+  email:
+    smtp_server: ""
+    smtp_port: 587
+    username: ""
+    password: ""
+    recipients:
+      - "team@example.com"
+    notify_on_failure: true
+    notify_on_success: false
+
+# Advanced Configuration
+advanced:
+  # Debugging options
+  debug:
+    enabled: false
+    save_debug_logs: true
+    kubectl_verbose: false
+    aws_debug: false
+
+  # Resource tagging
+  resource_tags:
+    Environment: "integration-test"
+    Project: "aws-efs-csi-driver"
+    TestSuite: "efs-namespace"
+    ManagedBy: "automation"
+
+  # Custom test parameters
+  custom:
+    # Add any custom test parameters here
+    example_parameter: "example_value"
+
+# Environment-specific overrides
+environments:
+  development:
+    execution:
+      timeout: 1800
+      parallel_tests: 2
+      verbose: true
+    test_data:
+      performance:
+        concurrent_operations: 5
+        data_size_mb: 50
+
+  staging:
+    execution:
+      timeout: 3600
+      parallel_tests: 4
+    aws:
+      create_efs_filesystem: false  # Use existing EFS in staging
+      cleanup_efs_filesystem: false
+
+  production:
+    execution:
+      timeout: 7200
+      parallel_tests: 8
+      fail_fast: true
+    test_data:
+      performance:
+        concurrent_operations: 20
+        data_size_mb: 500
+    notifications:
+      enabled: true
